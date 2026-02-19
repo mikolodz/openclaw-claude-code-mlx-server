@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Local configuration
+.env
+
+# Virtual environments
+.venv/
+venv/
+mlx_env/
+
+# Runtime artifacts
+logs/
+*.log
