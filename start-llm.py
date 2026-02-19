@@ -137,6 +137,7 @@ SETTINGS = _build_settings()
 # GLOBAL LOCK: Prevents concurrent GPU access (Fixes the crash)
 model_lock = threading.Lock()
 prompt_cache_lock = threading.Lock()
+console_lock = threading.Lock()
 
 proxy_process = None
 proxy_config_path = None
@@ -146,6 +147,13 @@ ARG_PAIR_PATTERN = re.compile(
     r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
     re.DOTALL | re.IGNORECASE,
 )
+
+
+def _terminal_status(icon: str, message: str, indent: int = 0) -> None:
+    with console_lock:
+        ts = datetime.now().strftime("%H:%M:%S")
+        pad = "  " * max(indent, 0)
+        print(f"{pad}{icon} [{ts}] {message}", flush=True)
 
 class LRUPromptCache:
     @dataclass
@@ -494,7 +502,7 @@ def _build_sampler(body):
 
 def start_litellm_proxy():
     global proxy_process, proxy_config_path
-    print(f"Launching LiteLLM Proxy on port {SETTINGS.proxy_port}...")
+    _terminal_status("🌉", f"Launching LiteLLM Proxy on port {SETTINGS.proxy_port}...")
 
     # Use proxy config so unsupported OpenAI params (e.g. "store") are dropped.
     config_yaml = f"""model_list:
@@ -562,11 +570,12 @@ litellm_settings:
             "LiteLLM proxy failed to start. "
             + (f"stderr: {stderr_output.strip()}" if stderr_output else "No stderr captured.")
         )
+    _terminal_status("✅", f"LiteLLM Proxy ready at http://127.0.0.1:{SETTINGS.proxy_port}")
 
 def cleanup():
     global proxy_config_path
     if proxy_process:
-        print("\n🧹 Shutting down LiteLLM Proxy...")
+        _terminal_status("🧹", "Shutting down LiteLLM Proxy...")
         proxy_process.terminate()
         proxy_process.wait()
     if proxy_config_path:
@@ -574,13 +583,13 @@ def cleanup():
             Path(proxy_config_path).unlink(missing_ok=True)
         except Exception:
             pass
-    print("👋 MLX Server stopped.")
+    _terminal_status("👋", "MLX Server stopped.")
 
 atexit.register(cleanup)
 
-print(f"Loading model: {SETTINGS.model_path}")
+_terminal_status("🚀", f"Loading model: {SETTINGS.model_path}")
 model, tokenizer = load(SETTINGS.model_path, tokenizer_config={"trust_remote_code": True})
-print("Model loaded.")
+_terminal_status("✅", "Model loaded.")
 
 
 def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
@@ -599,6 +608,10 @@ def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
     return kwargs
 
 class APIHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Keep terminal output focused on custom request lifecycle lines.
+        return
+
     def do_GET(self):
         if self.path == "/v1/models":
             self.send_response(200)
@@ -687,6 +700,7 @@ class APIHandler(BaseHTTPRequestHandler):
             )
 
         cache_key = prompt_tokens[:]
+        had_cache_hit = prompt_cache is not None
         if prompt_cache is None:
             prompt_cache = make_prompt_cache(model, max_kv_size=SETTINGS.max_kv_size)
             rest_tokens = prompt_tokens
@@ -701,11 +715,26 @@ class APIHandler(BaseHTTPRequestHandler):
             )
 
         is_streaming = body.get("stream", False)
+        _terminal_status(
+            "📨",
+            f"Request {request_id} received | stream={is_streaming} | prompt_tokens={len(prompt_tokens)}",
+        )
 
         acquired = False
+        generated_tokens = []
+        generation_started_at = None
+        queue_started_at = time.time()
         try:
             model_lock.acquire(blocking=True)
             acquired = True
+            generation_started_at = time.time()
+            cache_source = "hit" if had_cache_hit else "new"
+            wait_seconds = generation_started_at - queue_started_at
+            _terminal_status(
+                "⚙️",
+                f"Request {request_id} generation started | wait={wait_seconds:.2f}s | cache={cache_source}",
+                indent=1,
+            )
 
             if not is_streaming:
                 self.send_response(200)
@@ -713,10 +742,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
 
                 generated_parts = []
-                generated_tokens = []
+                progress_last_at = time.time()
                 for response in stream_generate(**_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)):
                     generated_parts.append(response.text)
                     generated_tokens.append(int(response.token))
+                    if len(generated_tokens) % 64 == 0 and (time.time() - progress_last_at) >= 1.0:
+                        progress_last_at = time.time()
+                        _terminal_status(
+                            "⏳",
+                            f"Request {request_id} in progress | generated_tokens={len(generated_tokens)}",
+                            indent=1,
+                        )
                 response_text = "".join(generated_parts)
                 raw_response_text = response_text
                 response_text = _normalize_assistant_text(response_text, enable_thinking)
@@ -782,13 +818,20 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
 
                 raw_parts = []
-                generated_tokens = []
+                progress_last_at = time.time()
                 for response in stream_generate(**_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)):
                     response_text = response.text
                     if not response_text:
                         continue
                     raw_parts.append(response_text)
                     generated_tokens.append(int(response.token))
+                    if len(generated_tokens) % 64 == 0 and (time.time() - progress_last_at) >= 1.0:
+                        progress_last_at = time.time()
+                        _terminal_status(
+                            "⏳",
+                            f"Request {request_id} in progress | generated_tokens={len(generated_tokens)}",
+                            indent=1,
+                        )
 
                 full_text = "".join(raw_parts)
                 raw_full_text = full_text
@@ -850,14 +893,26 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
 
         except BrokenPipeError:
-            print("Broken pipe (client disconnected)")
+            _terminal_status("⚠️", f"Request {request_id} client disconnected (BrokenPipeError)", indent=1)
             if request_logger:
                 request_logger.log("generation", "client disconnected (BrokenPipeError)", request_id=request_id)
         except Exception as e:
-            print(f"Error during generation: {e}")
+            _terminal_status("❌", f"Request {request_id} failed: {e}", indent=1)
             if request_logger:
                 request_logger.log("generation", f"error: {e}", request_id=request_id)
         finally:
+            if generation_started_at is not None:
+                elapsed = max(time.time() - generation_started_at, 1e-9)
+                output_tokens = len(generated_tokens)
+                speed = output_tokens / elapsed if output_tokens else 0.0
+                _terminal_status(
+                    "✅",
+                    (
+                        f"Request {request_id} finished | output_tokens={output_tokens} | "
+                        f"elapsed={elapsed:.2f}s | tok/s={speed:.2f}"
+                    ),
+                    indent=1,
+                )
             if acquired:
                 model_lock.release()
 
@@ -867,9 +922,9 @@ def run():
     httpd = ThreadingHTTPServer(server_address, APIHandler)
 
     print("\n" + "=" * 50)
-    print("SYSTEM READY")
-    print(f"  MLX Engine:   http://{SETTINGS.mlx_host}:{SETTINGS.mlx_port}")
-    print(f"  OpenClaw Link: http://127.0.0.1:{SETTINGS.proxy_port}")
+    print("🟢 SYSTEM READY")
+    print(f"   • MLX Engine:   http://{SETTINGS.mlx_host}:{SETTINGS.mlx_port}")
+    print(f"   • OpenClaw Link: http://127.0.0.1:{SETTINGS.proxy_port}")
     print("=" * 50 + "\n")
 
     try:
