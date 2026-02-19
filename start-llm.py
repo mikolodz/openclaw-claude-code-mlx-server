@@ -14,7 +14,7 @@ import shutil
 from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dotenv import load_dotenv
@@ -409,6 +409,122 @@ def _should_enable_thinking(body):
     # Default to disabled to avoid long/self-referential planning loops unless explicitly requested.
     return False
 
+
+def _reasoning_level_to_enable_thinking(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"off", "none", "disable", "disabled", "false", "0", "no"}:
+            return False
+        if normalized in {
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "default",
+            "on",
+            "enabled",
+            "true",
+            "1",
+            "yes",
+            "auto",
+        }:
+            return True
+    return None
+
+
+def _extract_enable_thinking(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Determine enable_thinking from explicit flag first, then common reasoning fields.
+
+    Supported sources:
+    - enable_thinking: bool
+    - thinking: str|bool|dict (OpenClaw / Anthropic style)
+    - reasoning_effort: str (OpenAI / LiteLLM style)
+    - reasoning: str|dict (Responses-style)
+    - metadata.{thinking, reasoning, reasoning_effort}
+    - extra_body.{thinking, reasoning, reasoning_effort}
+    """
+    if isinstance(body.get("enable_thinking"), bool):
+        return {
+            "enable_thinking": body["enable_thinking"],
+            "source": "enable_thinking",
+            "raw": body["enable_thinking"],
+        }
+
+    for key in ("thinking", "reasoning_effort"):
+        mapped = _reasoning_level_to_enable_thinking(body.get(key))
+        if mapped is not None:
+            return {
+                "enable_thinking": mapped,
+                "source": key,
+                "raw": body.get(key),
+            }
+
+    reasoning_obj = body.get("reasoning")
+    if isinstance(reasoning_obj, dict):
+        for nested_key in ("enabled", "effort", "level", "type"):
+            mapped = _reasoning_level_to_enable_thinking(reasoning_obj.get(nested_key))
+            if mapped is not None:
+                return {
+                    "enable_thinking": mapped,
+                    "source": f"reasoning.{nested_key}",
+                    "raw": reasoning_obj.get(nested_key),
+                }
+    else:
+        mapped = _reasoning_level_to_enable_thinking(reasoning_obj)
+        if mapped is not None:
+            return {
+                "enable_thinking": mapped,
+                "source": "reasoning",
+                "raw": reasoning_obj,
+            }
+
+    for container_key in ("metadata", "extra_body"):
+        container = body.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for key in ("thinking", "reasoning_effort"):
+            mapped = _reasoning_level_to_enable_thinking(container.get(key))
+            if mapped is not None:
+                return {
+                    "enable_thinking": mapped,
+                    "source": f"{container_key}.{key}",
+                    "raw": container.get(key),
+                }
+        nested_reasoning = container.get("reasoning")
+        if isinstance(nested_reasoning, dict):
+            for nested_key in ("enabled", "effort", "level", "type"):
+                mapped = _reasoning_level_to_enable_thinking(
+                    nested_reasoning.get(nested_key)
+                )
+                if mapped is not None:
+                    return {
+                        "enable_thinking": mapped,
+                        "source": f"{container_key}.reasoning.{nested_key}",
+                        "raw": nested_reasoning.get(nested_key),
+                    }
+        else:
+            mapped = _reasoning_level_to_enable_thinking(nested_reasoning)
+            if mapped is not None:
+                return {
+                    "enable_thinking": mapped,
+                    "source": f"{container_key}.reasoning",
+                    "raw": nested_reasoning,
+                }
+
+    return {
+        "enable_thinking": _should_enable_thinking(body),
+        "source": "default",
+        "raw": None,
+    }
+
 def _normalize_assistant_text(text, enable_thinking):
     if not isinstance(text, str):
         return text
@@ -530,6 +646,10 @@ def start_litellm_proxy():
       model: {SETTINGS.proxy_model_id}
       api_base: http://127.0.0.1:{SETTINGS.mlx_port}/v1
       api_key: local
+      # Keep these request fields when drop_params=true so this server can map
+      # OpenClaw/Claude reasoning intent into tokenizer enable_thinking.
+      allowed_openai_params:
+        - reasoning_effort
 litellm_settings:
   drop_params: true
 """
@@ -672,7 +792,8 @@ class APIHandler(BaseHTTPRequestHandler):
         request_id = uuid.uuid4().hex[:12]
         messages = _prepare_messages_for_template(body.get("messages", []))
         tools = body.get("tools")
-        enable_thinking = _should_enable_thinking(body)
+        reasoning_control = _extract_enable_thinking(body)
+        enable_thinking = reasoning_control["enable_thinking"]
 
         if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
             prompt = tokenizer.apply_chat_template(
@@ -711,6 +832,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         "temperature": body.get("temperature", SETTINGS.default_temperature),
                         "max_tokens": body.get("max_tokens", SETTINGS.default_max_tokens),
                         "enable_thinking": enable_thinking,
+                        "thinking_source": reasoning_control["source"],
+                        "thinking_raw": reasoning_control["raw"],
                         "cache_session_id": cache_session_id,
                         "cache_match_type": cache_match_type,
                         "matched_prefix_len": matched_prefix_len,
@@ -736,7 +859,8 @@ class APIHandler(BaseHTTPRequestHandler):
             f"Request {request_id} received | stream={body.get('stream', False)} | "
             f"prompt_tokens={len(prompt_tokens)} | cache={cache_match_type} | "
             f"prefix_tokens={matched_prefix_len} | rest_tokens={rest_count} | "
-            f"normalized={prompt_was_normalized}",
+            f"normalized={prompt_was_normalized} | "
+            f"thinking={enable_thinking} ({reasoning_control['source']})",
         )
 
         sampler, sampler_kwargs = _build_sampler(body)
