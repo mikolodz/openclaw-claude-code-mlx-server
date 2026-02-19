@@ -147,6 +147,9 @@ ARG_PAIR_PATTERN = re.compile(
     r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
     re.DOTALL | re.IGNORECASE,
 )
+INBOUND_META_MESSAGE_ID_PATTERN = re.compile(
+    r'("message_id"\s*:\s*")[^"]+(")'
+)
 
 
 def _terminal_status(icon: str, message: str, indent: int = 0) -> None:
@@ -169,6 +172,7 @@ class LRUPromptCache:
         shorter: List[int]
         longer: List[int]
         common_prefix: int
+        matched_prefix_len: int = 0
 
     def __init__(self, max_size=10, ttl_seconds=1800):
         self.max_size = max_size
@@ -200,7 +204,7 @@ class LRUPromptCache:
 
     def _search(self, model, tokens):
         if model not in self._cache:
-            return self.SearchResult(model, None, None, None, 0)
+            return self.SearchResult(model, None, None, None, 0, 0)
 
         current = self._cache[model]
         last_cache_index = -1
@@ -213,7 +217,7 @@ class LRUPromptCache:
             index += 1
 
         if last_cache_index == len(tokens) - 1:
-            return self.SearchResult(model, tokens, None, None, 0)
+            return self.SearchResult(model, tokens, None, None, 0, len(tokens))
 
         shorter = None
         if last_cache_index > 0:
@@ -235,7 +239,8 @@ class LRUPromptCache:
             if best is not None:
                 longer = tokens[:index] + best
 
-        return self.SearchResult(model, None, shorter, longer, common_prefix)
+        matched_prefix_len = len(shorter) if shorter is not None else common_prefix
+        return self.SearchResult(model, None, shorter, longer, common_prefix, matched_prefix_len)
 
     def _get(self, model, tokens):
         current = self._cache[model]
@@ -265,6 +270,9 @@ class LRUPromptCache:
         return self.CacheEntry(copy.deepcopy(entry.prompt_cache), 1, time.time())
 
     def fetch_nearest_cache(self, model, tokens):
+        """Returns (prompt_cache, rest_tokens, cache_session_tokens, cache_match_type, matched_prefix_len).
+        cache_match_type is one of 'exact', 'shorter', 'longer', 'miss'.
+        """
         self._prune_expired()
         result = self._search(model, tokens)
 
@@ -273,25 +281,26 @@ class LRUPromptCache:
             # Keep one token to continue decoding safely.
             if len(tokens) > 1 and can_trim_prompt_cache(entry.prompt_cache):
                 trim_prompt_cache(entry.prompt_cache, 1)
-                return entry.prompt_cache, tokens[-1:], result.exact
-            return entry.prompt_cache, tokens, result.exact
+                return entry.prompt_cache, tokens[-1:], result.exact, "exact", len(tokens) - 1
+            return entry.prompt_cache, tokens, result.exact, "exact", len(tokens)
 
         if result.shorter is not None:
             entry = self._extract(result.model, result.shorter)
             prefix_len = len(result.shorter)
-            return entry.prompt_cache, tokens[prefix_len:], result.shorter
+            return entry.prompt_cache, tokens[prefix_len:], result.shorter, "shorter", prefix_len
 
         if result.longer is not None:
             entry = self._get(result.model, result.longer)
-            entry.touched_at = time.time()
-            if can_trim_prompt_cache(entry.prompt_cache):
-                entry = self.CacheEntry(copy.deepcopy(entry.prompt_cache), 1, time.time())
-                prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(entry.prompt_cache, num_to_trim)
-                return entry.prompt_cache, tokens[prefix:], result.longer
+            if not can_trim_prompt_cache(entry.prompt_cache):
+                return None, tokens, tokens, "miss", 0
+            prefix = min(len(tokens) - 1, result.common_prefix)
+            # Avoid deepcopy: extract (remove from cache), then trim in place.
+            entry = self._extract(result.model, result.longer)
+            num_to_trim = len(result.longer) - prefix
+            trim_prompt_cache(entry.prompt_cache, num_to_trim)
+            return entry.prompt_cache, tokens[prefix:], result.longer, "longer", prefix
 
-        return None, tokens, tokens
+        return None, tokens, tokens, "miss", 0
 
     def insert_cache(self, model, tokens, prompt_cache):
         self._prune_expired()
@@ -459,6 +468,16 @@ def _tokenize_prompt(prompt):
     if isinstance(prompt, list):
         return prompt
     return list(prompt)
+
+
+def _normalize_prompt_for_cache(prompt):
+    """
+    Normalize volatile, non-semantic metadata that changes every request
+    (e.g., inbound message_id) to keep cache keys stable across turns.
+    """
+    if not isinstance(prompt, str):
+        return prompt
+    return INBOUND_META_MESSAGE_ID_PATTERN.sub(r'\1__CACHE_STABLE_MESSAGE_ID__\2', prompt)
 
 
 def _build_sampler(body):
@@ -666,9 +685,11 @@ class APIHandler(BaseHTTPRequestHandler):
         else:
             prompt = messages[-1]["content"] if messages else ""
 
-        prompt_tokens = _tokenize_prompt(prompt)
+        cache_prompt = _normalize_prompt_for_cache(prompt)
+        prompt_tokens = _tokenize_prompt(cache_prompt)
+        prompt_was_normalized = cache_prompt != prompt
         with prompt_cache_lock:
-            prompt_cache, rest_tokens, cache_session_tokens = PROMPT_CACHE.fetch_nearest_cache(
+            prompt_cache, rest_tokens, cache_session_tokens, cache_match_type, matched_prefix_len = PROMPT_CACHE.fetch_nearest_cache(
                 SETTINGS.model_path, prompt_tokens
             )
         cache_session_id = _cache_session_id(cache_session_tokens)
@@ -691,6 +712,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         "max_tokens": body.get("max_tokens", SETTINGS.default_max_tokens),
                         "enable_thinking": enable_thinking,
                         "cache_session_id": cache_session_id,
+                        "cache_match_type": cache_match_type,
+                        "matched_prefix_len": matched_prefix_len,
+                        "cache_prompt_normalized": prompt_was_normalized,
+                        "prompt_tokens": len(prompt_tokens),
                     },
                     "messages": messages,
                     "tools": tools,
@@ -705,34 +730,44 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_cache = make_prompt_cache(model, max_kv_size=SETTINGS.max_kv_size)
             rest_tokens = prompt_tokens
 
+        rest_count = len(rest_tokens) if rest_tokens is not None else len(prompt_tokens)
+        _terminal_status(
+            "📨",
+            f"Request {request_id} received | stream={body.get('stream', False)} | "
+            f"prompt_tokens={len(prompt_tokens)} | cache={cache_match_type} | "
+            f"prefix_tokens={matched_prefix_len} | rest_tokens={rest_count} | "
+            f"normalized={prompt_was_normalized}",
+        )
+
         sampler, sampler_kwargs = _build_sampler(body)
         max_tokens = body.get("max_tokens", SETTINGS.default_max_tokens)
         if request_logger:
             request_logger.log(
                 "sampler",
-                {"applied_kwargs": sampler_kwargs},
+                {
+                    "applied_kwargs": sampler_kwargs,
+                    "rest_tokens": rest_count,
+                    "matched_prefix_len": matched_prefix_len,
+                },
                 request_id=request_id,
             )
 
         is_streaming = body.get("stream", False)
-        _terminal_status(
-            "📨",
-            f"Request {request_id} received | stream={is_streaming} | prompt_tokens={len(prompt_tokens)}",
-        )
 
         acquired = False
         generated_tokens = []
         generation_started_at = None
+        first_token_at = None
         queue_started_at = time.time()
         try:
             model_lock.acquire(blocking=True)
             acquired = True
             generation_started_at = time.time()
-            cache_source = "hit" if had_cache_hit else "new"
             wait_seconds = generation_started_at - queue_started_at
             _terminal_status(
                 "⚙️",
-                f"Request {request_id} generation started | wait={wait_seconds:.2f}s | cache={cache_source}",
+                f"Request {request_id} generation started | wait={wait_seconds:.2f}s | "
+                f"cache={cache_match_type} | prefix_tokens={matched_prefix_len} | prefill_tokens={rest_count}",
                 indent=1,
             )
 
@@ -746,6 +781,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 for response in stream_generate(**_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)):
                     generated_parts.append(response.text)
                     generated_tokens.append(int(response.token))
+                    if first_token_at is None:
+                        first_token_at = time.time()
                     if len(generated_tokens) % 64 == 0 and (time.time() - progress_last_at) >= 1.0:
                         progress_last_at = time.time()
                         _terminal_status(
@@ -786,10 +823,17 @@ class APIHandler(BaseHTTPRequestHandler):
                     full_response["choices"][0]["message"]["tool_calls"] = tool_calls
                 self.wfile.write(json.dumps(full_response).encode("utf-8"))
                 if request_logger:
+                    timing = {}
+                    if first_token_at is not None and generation_started_at is not None:
+                        timing["prefill_seconds"] = first_token_at - generation_started_at
+                        timing["decode_seconds"] = time.time() - first_token_at
+                        timing["prefill_tps"] = rest_count / timing["prefill_seconds"] if timing["prefill_seconds"] > 0 else None
+                        timing["decode_tps"] = len(generated_tokens) / timing["decode_seconds"] if timing["decode_seconds"] > 0 else None
                     request_logger.log(
                         "generation",
                         {
                             "mode": "non-stream",
+                            "timing": timing,
                             "raw_response_text": raw_response_text,
                             "normalized_response_text": response_text,
                             "assistant_message_text": message_text,
@@ -820,11 +864,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 raw_parts = []
                 progress_last_at = time.time()
                 for response in stream_generate(**_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)):
-                    response_text = response.text
-                    if not response_text:
-                        continue
-                    raw_parts.append(response_text)
                     generated_tokens.append(int(response.token))
+                    if first_token_at is None:
+                        first_token_at = time.time()
+                    response_text = response.text
+                    if response_text:
+                        raw_parts.append(response_text)
                     if len(generated_tokens) % 64 == 0 and (time.time() - progress_last_at) >= 1.0:
                         progress_last_at = time.time()
                         _terminal_status(
@@ -879,10 +924,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
                 self.wfile.write(b"data: [DONE]\n\n")
                 if request_logger:
+                    timing = {}
+                    if first_token_at is not None and generation_started_at is not None:
+                        timing["prefill_seconds"] = first_token_at - generation_started_at
+                        timing["decode_seconds"] = time.time() - first_token_at
+                        timing["prefill_tps"] = rest_count / timing["prefill_seconds"] if timing["prefill_seconds"] > 0 else None
+                        timing["decode_tps"] = len(generated_tokens) / timing["decode_seconds"] if timing["decode_seconds"] > 0 else None
                     request_logger.log(
                         "generation",
                         {
                             "mode": "stream",
+                            "timing": timing,
                             "raw_response_text": raw_full_text,
                             "normalized_response_text": full_text,
                             "assistant_message_text": message_text,
@@ -902,17 +954,34 @@ class APIHandler(BaseHTTPRequestHandler):
                 request_logger.log("generation", f"error: {e}", request_id=request_id)
         finally:
             if generation_started_at is not None:
-                elapsed = max(time.time() - generation_started_at, 1e-9)
+                end_at = time.time()
+                elapsed = max(end_at - generation_started_at, 1e-9)
                 output_tokens = len(generated_tokens)
                 speed = output_tokens / elapsed if output_tokens else 0.0
-                _terminal_status(
-                    "✅",
-                    (
-                        f"Request {request_id} finished | output_tokens={output_tokens} | "
-                        f"elapsed={elapsed:.2f}s | tok/s={speed:.2f}"
-                    ),
-                    indent=1,
-                )
+                if first_token_at is not None:
+                    prefill_seconds = first_token_at - generation_started_at
+                    decode_seconds = max(end_at - first_token_at, 1e-9)
+                    decode_tps = output_tokens / decode_seconds if output_tokens else 0.0
+                    prefill_tps = rest_count / prefill_seconds if prefill_seconds > 0 else 0.0
+                    _terminal_status(
+                        "✅",
+                        (
+                            f"Request {request_id} finished | output_tokens={output_tokens} | "
+                            f"elapsed={elapsed:.2f}s | tok/s={speed:.2f} | "
+                            f"prefill={prefill_seconds:.2f}s ({prefill_tps:.0f} tok/s) | "
+                            f"decode={decode_seconds:.2f}s ({decode_tps:.1f} tok/s)"
+                        ),
+                        indent=1,
+                    )
+                else:
+                    _terminal_status(
+                        "✅",
+                        (
+                            f"Request {request_id} finished | output_tokens={output_tokens} | "
+                            f"elapsed={elapsed:.2f}s | tok/s={speed:.2f}"
+                        ),
+                        indent=1,
+                    )
             if acquired:
                 model_lock.release()
 
