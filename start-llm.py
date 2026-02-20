@@ -81,6 +81,7 @@ def _env_kv_bits(name: str, default: Optional[int]) -> Optional[int]:
 @dataclass(frozen=True)
 class Settings:
     model_path: str
+    model_family: str
     mlx_host: str
     mlx_port: int
     proxy_port: int
@@ -97,19 +98,42 @@ class Settings:
     default_repetition_context_size: int
     default_max_tokens: int
     enable_request_logging: bool
+    normalize_write_tool_content_for_prompt: bool
     log_root: Path
     proxy_startup_wait_seconds: float
     proxy_model_id: str
 
 
+def _normalize_model_family(value: Optional[str]) -> str:
+    raw = (value or "").strip().lower()
+    if raw in {"qwen", "qwen3", "qen3"}:
+        return "qwen3"
+    if raw in {"glm", "glm4", "glm-4"}:
+        return "glm4"
+    return "generic"
+
+
+def _infer_model_family(model_path: str) -> str:
+    normalized = (model_path or "").strip().lower()
+    if "qwen" in normalized:
+        return "qwen3"
+    if "glm" in normalized:
+        return "glm4"
+    return "generic"
+
+
 def _build_settings() -> Settings:
     model_path = _env_str("MODEL_PATH", "lmstudio-community/GLM-4.7-Flash-MLX-4bit")
+    model_family = _normalize_model_family(
+        _env_str("MODEL_FAMILY", _infer_model_family(model_path))
+    )
     proxy_model_id = _env_str(
         "PROXY_MODEL_ID",
         model_path if model_path.startswith("openai/") else f"openai/{model_path}",
     )
     return Settings(
         model_path=model_path,
+        model_family=model_family,
         mlx_host=_env_str("MLX_HOST", "127.0.0.1"),
         mlx_port=_env_int("MLX_PORT", 8080),
         proxy_port=_env_int("PROXY_PORT", 4000),
@@ -126,6 +150,7 @@ def _build_settings() -> Settings:
         default_repetition_context_size=_env_int("DEFAULT_REPETITION_CONTEXT_SIZE", 256),
         default_max_tokens=_env_int("DEFAULT_MAX_TOKENS", 2048),
         enable_request_logging=_env_bool("ENABLE_REQUEST_LOGGING", True),
+        normalize_write_tool_content_for_prompt=_env_bool("NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", True),
         log_root=Path(_env_str("LOG_ROOT", str(SCRIPT_DIR / "logs"))),
         proxy_startup_wait_seconds=_env_float("PROXY_STARTUP_WAIT_SECONDS", 2.0),
         proxy_model_id=proxy_model_id,
@@ -147,6 +172,8 @@ ARG_PAIR_PATTERN = re.compile(
     r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
     re.DOTALL | re.IGNORECASE,
 )
+QWEN_FUNCTION_PATTERN = re.compile(r"<function=([^>\s]+)>\s*(.*?)\s*</function>", re.DOTALL | re.IGNORECASE)
+QWEN_PARAMETER_PATTERN = re.compile(r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", re.DOTALL | re.IGNORECASE)
 INBOUND_META_MESSAGE_ID_PATTERN = re.compile(
     r'("message_id"\s*:\s*")[^"]+(")'
 )
@@ -390,12 +417,41 @@ def _prepare_messages_for_template(messages):
                 fn = tc_copy.get("function")
                 if isinstance(fn, dict):
                     fn_copy = dict(fn)
+                    fn_name = str(fn_copy.get("name", "")).strip().lower()
                     args = fn_copy.get("arguments")
                     if isinstance(args, str):
                         try:
                             fn_copy["arguments"] = json.loads(args)
                         except Exception:
                             fn_copy["arguments"] = {"raw": args}
+                    if (
+                        SETTINGS.normalize_write_tool_content_for_prompt
+                        and fn_name == "write"
+                        and isinstance(fn_copy.get("arguments"), dict)
+                        and "content" in fn_copy["arguments"]
+                    ):
+                        # Keep write semantics (path + write intent) while stabilizing
+                        # prompt tokens by replacing huge inline content with a digest tag.
+                        raw_content = fn_copy["arguments"]["content"]
+                        if isinstance(raw_content, str):
+                            raw_bytes = raw_content.encode("utf-8")
+                            digest = hashlib.sha1(raw_bytes).hexdigest()[:16]
+                            placeholder = (
+                                f"__WRITE_CONTENT_OMITTED__sha1={digest};"
+                                f"bytes={len(raw_bytes)};chars={len(raw_content)};"
+                                f"lines={raw_content.count(chr(10)) + 1}__"
+                            )
+                        else:
+                            serialized = json.dumps(raw_content, ensure_ascii=False, sort_keys=True)
+                            raw_bytes = serialized.encode("utf-8")
+                            digest = hashlib.sha1(raw_bytes).hexdigest()[:16]
+                            placeholder = (
+                                f"__WRITE_CONTENT_OMITTED_NONSTRING__sha1={digest};"
+                                f"bytes={len(raw_bytes)}__"
+                            )
+                        args_copy = dict(fn_copy["arguments"])
+                        args_copy["content"] = placeholder
+                        fn_copy["arguments"] = args_copy
                     tc_copy["function"] = fn_copy
                 fixed_tool_calls.append(tc_copy)
             m["tool_calls"] = fixed_tool_calls
@@ -525,8 +581,12 @@ def _extract_enable_thinking(body: Dict[str, Any]) -> Dict[str, Any]:
         "raw": None,
     }
 
-def _normalize_assistant_text(text, enable_thinking):
+def _normalize_assistant_text(text, enable_thinking, model_family):
     if not isinstance(text, str):
+        return text
+    # Qwen3 output can be sensitive to synthetic prefix injection.
+    # Keep raw text stable so next-turn prompt tokens stay cache-friendly.
+    if model_family == "qwen3":
         return text
     if enable_thinking and text and not text.lstrip().startswith("<think>"):
         return "<think>" + text
@@ -539,40 +599,88 @@ def _coerce_arg_value(raw_value):
     except Exception:
         return value
 
-def _extract_openai_tool_calls(text):
+def _extract_openai_tool_calls(text, model_family):
     if not isinstance(text, str) or "<tool_call>" not in text:
         return text, []
 
-    tool_calls = []
-    cleaned_text = text
-
-    for match in TOOL_CALL_PATTERN.finditer(text):
-        body = match.group(1).strip()
-        if not body:
-            continue
-
+    def _parse_legacy_block(body):
         name_match = re.match(r"^([^\s<]+)", body)
         if not name_match:
-            continue
+            return None
         tool_name = name_match.group(1).strip()
-
+        if not tool_name:
+            return None
         args = {}
         for arg_key, arg_value in ARG_PAIR_PATTERN.findall(body):
             key = arg_key.strip()
             if not key:
                 continue
             args[key] = _coerce_arg_value(arg_value)
-
-        tool_calls.append({
+        return {
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
             "function": {
                 "name": tool_name,
                 "arguments": json.dumps(args, ensure_ascii=False),
             },
-        })
+        }
 
-    cleaned_text = TOOL_CALL_PATTERN.sub("", cleaned_text).strip()
+    def _parse_qwen_block(body):
+        function_match = QWEN_FUNCTION_PATTERN.search(body)
+        if not function_match:
+            return None
+        tool_name = function_match.group(1).strip()
+        fn_body = function_match.group(2)
+        if not tool_name:
+            return None
+        args = {}
+        for key, value in QWEN_PARAMETER_PATTERN.findall(fn_body):
+            param_key = key.strip()
+            if not param_key:
+                continue
+            args[param_key] = _coerce_arg_value(value)
+        return {
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        }
+
+    tool_calls = []
+    remove_spans = []
+
+    for match in TOOL_CALL_PATTERN.finditer(text):
+        body = match.group(1).strip()
+        if not body:
+            continue
+        parsed = None
+        if model_family == "qwen3":
+            parsed = _parse_qwen_block(body)
+            if parsed is None:
+                parsed = _parse_legacy_block(body)
+        else:
+            parsed = _parse_legacy_block(body)
+            if parsed is None:
+                parsed = _parse_qwen_block(body)
+        if parsed is None:
+            continue
+        tool_calls.append(parsed)
+        remove_spans.append(match.span())
+
+    if not remove_spans:
+        return text, tool_calls
+
+    cleaned_parts = []
+    cursor = 0
+    for start, end in remove_spans:
+        if start > cursor:
+            cleaned_parts.append(text[cursor:start])
+        cursor = end
+    if cursor < len(text):
+        cleaned_parts.append(text[cursor:])
+    cleaned_text = "".join(cleaned_parts).strip()
     return cleaned_text, tool_calls
 
 def _tokenize_prompt(prompt):
@@ -809,73 +917,16 @@ class APIHandler(BaseHTTPRequestHandler):
         cache_prompt = _normalize_prompt_for_cache(prompt)
         prompt_tokens = _tokenize_prompt(cache_prompt)
         prompt_was_normalized = cache_prompt != prompt
-        with prompt_cache_lock:
-            prompt_cache, rest_tokens, cache_session_tokens, cache_match_type, matched_prefix_len = PROMPT_CACHE.fetch_nearest_cache(
-                SETTINGS.model_path, prompt_tokens
-            )
-        cache_session_id = _cache_session_id(cache_session_tokens)
-        request_logger = None
-        if SETTINGS.enable_request_logging:
-            try:
-                request_logger = CacheSessionTranscriptLogger(cache_session_id=cache_session_id)
-            except Exception:
-                request_logger = None
-
-        if request_logger:
-            request_logger.log(
-                "prompt",
-                {
-                    "request_meta": {
-                        "path": self.path,
-                        "stream": bool(body.get("stream", False)),
-                        "model": body.get("model", SETTINGS.model_path),
-                        "temperature": body.get("temperature", SETTINGS.default_temperature),
-                        "max_tokens": body.get("max_tokens", SETTINGS.default_max_tokens),
-                        "enable_thinking": enable_thinking,
-                        "thinking_source": reasoning_control["source"],
-                        "thinking_raw": reasoning_control["raw"],
-                        "cache_session_id": cache_session_id,
-                        "cache_match_type": cache_match_type,
-                        "matched_prefix_len": matched_prefix_len,
-                        "cache_prompt_normalized": prompt_was_normalized,
-                        "prompt_tokens": len(prompt_tokens),
-                    },
-                    "messages": messages,
-                    "tools": tools,
-                    "rendered_prompt": prompt,
-                },
-                request_id=request_id,
-            )
-
         cache_key = prompt_tokens[:]
-        had_cache_hit = prompt_cache is not None
-        if prompt_cache is None:
-            prompt_cache = make_prompt_cache(model, max_kv_size=SETTINGS.max_kv_size)
-            rest_tokens = prompt_tokens
-
-        rest_count = len(rest_tokens) if rest_tokens is not None else len(prompt_tokens)
-        _terminal_status(
-            "📨",
-            f"Request {request_id} received | stream={body.get('stream', False)} | "
-            f"prompt_tokens={len(prompt_tokens)} | cache={cache_match_type} | "
-            f"prefix_tokens={matched_prefix_len} | rest_tokens={rest_count} | "
-            f"normalized={prompt_was_normalized} | "
-            f"thinking={enable_thinking} ({reasoning_control['source']})",
-        )
-
+        prompt_cache = None
+        rest_tokens = prompt_tokens
+        cache_session_tokens = prompt_tokens
+        cache_match_type = "miss"
+        matched_prefix_len = 0
+        rest_count = len(prompt_tokens)
+        request_logger = None
         sampler, sampler_kwargs = _build_sampler(body)
         max_tokens = body.get("max_tokens", SETTINGS.default_max_tokens)
-        if request_logger:
-            request_logger.log(
-                "sampler",
-                {
-                    "applied_kwargs": sampler_kwargs,
-                    "rest_tokens": rest_count,
-                    "matched_prefix_len": matched_prefix_len,
-                },
-                request_id=request_id,
-            )
-
         is_streaming = body.get("stream", False)
 
         acquired = False
@@ -888,6 +939,66 @@ class APIHandler(BaseHTTPRequestHandler):
             acquired = True
             generation_started_at = time.time()
             wait_seconds = generation_started_at - queue_started_at
+            with prompt_cache_lock:
+                prompt_cache, rest_tokens, cache_session_tokens, cache_match_type, matched_prefix_len = PROMPT_CACHE.fetch_nearest_cache(
+                    SETTINGS.model_path, prompt_tokens
+                )
+            if prompt_cache is None:
+                prompt_cache = make_prompt_cache(model, max_kv_size=SETTINGS.max_kv_size)
+                rest_tokens = prompt_tokens
+            rest_count = len(rest_tokens) if rest_tokens is not None else len(prompt_tokens)
+            cache_session_id = _cache_session_id(cache_session_tokens)
+            if SETTINGS.enable_request_logging:
+                try:
+                    request_logger = CacheSessionTranscriptLogger(cache_session_id=cache_session_id)
+                except Exception:
+                    request_logger = None
+
+            if request_logger:
+                request_logger.log(
+                    "prompt",
+                    {
+                        "request_meta": {
+                            "path": self.path,
+                            "stream": bool(body.get("stream", False)),
+                            "model": body.get("model", SETTINGS.model_path),
+                            "model_family": SETTINGS.model_family,
+                            "temperature": body.get("temperature", SETTINGS.default_temperature),
+                            "max_tokens": body.get("max_tokens", SETTINGS.default_max_tokens),
+                            "enable_thinking": enable_thinking,
+                            "thinking_source": reasoning_control["source"],
+                            "thinking_raw": reasoning_control["raw"],
+                            "cache_session_id": cache_session_id,
+                            "cache_match_type": cache_match_type,
+                            "matched_prefix_len": matched_prefix_len,
+                            "cache_prompt_normalized": prompt_was_normalized,
+                            "prompt_tokens": len(prompt_tokens),
+                        },
+                        "messages": messages,
+                        "tools": tools,
+                        "rendered_prompt": prompt,
+                    },
+                    request_id=request_id,
+                )
+                request_logger.log(
+                    "sampler",
+                    {
+                        "applied_kwargs": sampler_kwargs,
+                        "rest_tokens": rest_count,
+                        "matched_prefix_len": matched_prefix_len,
+                    },
+                    request_id=request_id,
+                )
+
+            _terminal_status(
+                "📨",
+                f"Request {request_id} received | stream={body.get('stream', False)} | "
+                f"prompt_tokens={len(prompt_tokens)} | cache={cache_match_type} | "
+                f"prefix_tokens={matched_prefix_len} | rest_tokens={rest_count} | "
+                f"normalized={prompt_was_normalized} | "
+                f"thinking={enable_thinking} ({reasoning_control['source']}) | "
+                f"family={SETTINGS.model_family}",
+            )
             _terminal_status(
                 "⚙️",
                 f"Request {request_id} generation started | wait={wait_seconds:.2f}s | "
@@ -916,8 +1027,12 @@ class APIHandler(BaseHTTPRequestHandler):
                         )
                 response_text = "".join(generated_parts)
                 raw_response_text = response_text
-                response_text = _normalize_assistant_text(response_text, enable_thinking)
-                message_text, tool_calls = _extract_openai_tool_calls(response_text)
+                response_text = _normalize_assistant_text(
+                    response_text, enable_thinking, SETTINGS.model_family
+                )
+                message_text, tool_calls = _extract_openai_tool_calls(
+                    response_text, SETTINGS.model_family
+                )
                 finish_reason = "tool_calls" if tool_calls else "stop"
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
@@ -1004,8 +1119,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 full_text = "".join(raw_parts)
                 raw_full_text = full_text
-                full_text = _normalize_assistant_text(full_text, enable_thinking)
-                message_text, tool_calls = _extract_openai_tool_calls(full_text)
+                full_text = _normalize_assistant_text(
+                    full_text, enable_thinking, SETTINGS.model_family
+                )
+                message_text, tool_calls = _extract_openai_tool_calls(
+                    full_text, SETTINGS.model_family
+                )
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
                     PROMPT_CACHE.insert_cache(SETTINGS.model_path, cache_key, prompt_cache)
