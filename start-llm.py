@@ -14,7 +14,7 @@ import shutil
 from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dotenv import load_dotenv
@@ -65,6 +65,39 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_str_any(names: List[str], default: str) -> str:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None and raw.strip() != "":
+            return raw.strip()
+    return default
+
+
+def _env_int_any(names: List[str], default: int) -> int:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None or raw.strip() == "":
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return default
+
+
+def _env_bool_any(names: List[str], default: bool) -> bool:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None or raw.strip() == "":
+            continue
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
 def _env_kv_bits(name: str, default: Optional[int]) -> Optional[int]:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -85,8 +118,10 @@ class Settings:
     mlx_host: str
     mlx_port: int
     proxy_port: int
-    prompt_cache_max_size: int
+    prompt_cache_max_entries_global: int
+    prompt_cache_max_entries_per_session: int
     prompt_cache_ttl_seconds: int
+    prompt_cache_session_max_idle_seconds: int
     max_kv_size: int
     kv_group_size: int
     kv_bits: Optional[int]
@@ -99,6 +134,8 @@ class Settings:
     default_max_tokens: int
     enable_request_logging: bool
     normalize_write_tool_content_for_prompt: bool
+    cache_canonicalize_tool_context: bool
+    cache_session_partitioning: bool
     log_root: Path
     proxy_startup_wait_seconds: float
     proxy_model_id: str
@@ -137,8 +174,19 @@ def _build_settings() -> Settings:
         mlx_host=_env_str("MLX_HOST", "127.0.0.1"),
         mlx_port=_env_int("MLX_PORT", 8080),
         proxy_port=_env_int("PROXY_PORT", 4000),
-        prompt_cache_max_size=_env_int("PROMPT_CACHE_MAX_SIZE", 24),
+        prompt_cache_max_entries_global=_env_int_any(
+            ["PROMPT_CACHE_MAX_ENTRIES_GLOBAL", "PROMPT_CACHE_MAX_SIZE"],
+            24,
+        ),
+        prompt_cache_max_entries_per_session=_env_int_any(
+            ["PROMPT_CACHE_MAX_ENTRIES_PER_SESSION"],
+            2,
+        ),
         prompt_cache_ttl_seconds=_env_int("PROMPT_CACHE_TTL_SECONDS", 30 * 60),
+        prompt_cache_session_max_idle_seconds=_env_int_any(
+            ["PROMPT_CACHE_SESSION_MAX_IDLE_SECONDS"],
+            30 * 60,
+        ),
         max_kv_size=_env_int("MAX_KV_SIZE", 196608),
         kv_group_size=_env_int("KV_GROUP_SIZE", 64),
         kv_bits=_env_kv_bits("KV_BITS", None),
@@ -151,6 +199,14 @@ def _build_settings() -> Settings:
         default_max_tokens=_env_int("DEFAULT_MAX_TOKENS", 2048),
         enable_request_logging=_env_bool("ENABLE_REQUEST_LOGGING", True),
         normalize_write_tool_content_for_prompt=_env_bool("NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", True),
+        cache_canonicalize_tool_context=_env_bool_any(
+            ["CACHE_CANONICALIZE_TOOL_CONTEXT"],
+            True,
+        ),
+        cache_session_partitioning=_env_bool_any(
+            ["CACHE_SESSION_PARTITIONING"],
+            True,
+        ),
         log_root=Path(_env_str("LOG_ROOT", str(SCRIPT_DIR / "logs"))),
         proxy_startup_wait_seconds=_env_float("PROXY_STARTUP_WAIT_SECONDS", 2.0),
         proxy_model_id=proxy_model_id,
@@ -176,6 +232,20 @@ QWEN_FUNCTION_PATTERN = re.compile(r"<function=([^>\s]+)>\s*(.*?)\s*</function>"
 QWEN_PARAMETER_PATTERN = re.compile(r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", re.DOTALL | re.IGNORECASE)
 INBOUND_META_MESSAGE_ID_PATTERN = re.compile(
     r'("message_id"\s*:\s*")[^"]+(")'
+)
+INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN = re.compile(
+    r"## Group Chat Context\s*\n"
+    r"## Inbound Context \(trusted metadata\)\s*\n"
+    r".*?```json\s*\n.*?\n```\s*\n?",
+    re.DOTALL,
+)
+CACHE_STABLE_INBOUND_CONTEXT_BLOCK = (
+    "## Group Chat Context\n"
+    "## Inbound Context (trusted metadata)\n"
+    "__CACHE_STABLE_INBOUND_CONTEXT__\n"
+)
+INBOUND_CONTEXT_TO_PROJECT_BOUNDARY_PATTERN = re.compile(
+    r"(__CACHE_STABLE_INBOUND_CONTEXT__)\n+# Project Context"
 )
 
 
@@ -208,6 +278,9 @@ class LRUPromptCache:
         self._lru = deque()
 
     def _is_expired(self, entry):
+        # TTL <= 0 means "no TTL expiry" (keep entries until LRU pressure).
+        if self.ttl_seconds <= 0:
+            return False
         return (time.time() - entry.touched_at) > self.ttl_seconds
 
     def _prune_expired(self):
@@ -229,7 +302,11 @@ class LRUPromptCache:
             except ValueError:
                 pass
 
+    def prune_expired(self):
+        self._prune_expired()
+
     def _search(self, model, tokens):
+        tokens = tuple(tokens)
         if model not in self._cache:
             return self.SearchResult(model, None, None, None, 0, 0)
 
@@ -254,7 +331,7 @@ class LRUPromptCache:
         common_prefix = index
         if index > 0 and last_cache_index <= 0:
             best = None
-            stack = [(current, [])]
+            stack = [(current, tuple())]
             while stack:
                 node, extra = stack.pop()
                 if "cache" in node:
@@ -262,7 +339,7 @@ class LRUPromptCache:
                         best = extra
                 else:
                     for tok in node:
-                        stack.append((node[tok], extra + [tok]))
+                        stack.append((node[tok], extra + (tok,)))
             if best is not None:
                 longer = tokens[:index] + best
 
@@ -270,12 +347,14 @@ class LRUPromptCache:
         return self.SearchResult(model, None, shorter, longer, common_prefix, matched_prefix_len)
 
     def _get(self, model, tokens):
+        tokens = tuple(tokens)
         current = self._cache[model]
         for tok in tokens:
             current = current[tok]
         return current["cache"]
 
     def _delete(self, model, tokens):
+        tokens = tuple(tokens)
         path = [self._cache[model]]
         for tok in tokens:
             path.append(path[-1][tok])
@@ -287,6 +366,7 @@ class LRUPromptCache:
             del prev_node[tok]
 
     def _extract(self, model, tokens):
+        tokens = tuple(tokens)
         entry = self._get(model, tokens)
         entry.touched_at = time.time()
         if entry.count == 1:
@@ -295,6 +375,23 @@ class LRUPromptCache:
             return entry
         entry.count -= 1
         return self.CacheEntry(copy.deepcopy(entry.prompt_cache), 1, time.time())
+
+    def contains_tokens(self, model, tokens):
+        tokens = tuple(tokens)
+        if model not in self._cache:
+            return False
+        current = self._cache[model]
+        for tok in tokens:
+            if tok not in current:
+                return False
+            current = current[tok]
+        return "cache" in current
+
+    def extract_exact_cache(self, model, tokens):
+        tokens = tuple(tokens)
+        if not self.contains_tokens(model, tokens):
+            return None
+        return self._extract(model, tokens)
 
     def fetch_nearest_cache(self, model, tokens):
         """Returns (prompt_cache, rest_tokens, cache_session_tokens, cache_match_type, matched_prefix_len).
@@ -330,6 +427,7 @@ class LRUPromptCache:
         return None, tokens, tokens, "miss", 0
 
     def insert_cache(self, model, tokens, prompt_cache):
+        tokens = tuple(tokens)
         self._prune_expired()
         if model not in self._cache:
             self._cache[model] = {}
@@ -353,8 +451,222 @@ class LRUPromptCache:
             self._delete(old_model, old_tokens)
 
 PROMPT_CACHE = LRUPromptCache(
-    max_size=SETTINGS.prompt_cache_max_size,
+    max_size=SETTINGS.prompt_cache_max_entries_global,
     ttl_seconds=SETTINGS.prompt_cache_ttl_seconds,
+)
+
+
+@dataclass(frozen=True)
+class SessionContext:
+    session_id: str
+    parent_session_id: Optional[str]
+    branch_id: Optional[str]
+    source: str
+
+
+class SessionIndex:
+    @dataclass
+    class SessionState:
+        parent_session_id: Optional[str]
+        touched_at: float
+        keys: deque
+        anchors: deque
+
+    def __init__(self, max_entries_per_session: int, max_idle_seconds: int):
+        self._max_entries_per_session = max(1, max_entries_per_session)
+        self._max_idle_seconds = max_idle_seconds
+        self._max_anchor_entries = max(4, self._max_entries_per_session * 4)
+        self._anchor_stride_tokens = 2048
+        self._sessions: Dict[str, SessionIndex.SessionState] = {}
+
+    def _prune_idle(self) -> None:
+        if self._max_idle_seconds <= 0:
+            return
+        now = time.time()
+        stale = [
+            session_id
+            for session_id, state in self._sessions.items()
+            if (now - state.touched_at) > self._max_idle_seconds
+        ]
+        for session_id in stale:
+            self._sessions.pop(session_id, None)
+
+    def _lineage_chain(self, session_id: str, max_depth: int = 8) -> List[str]:
+        chain: List[str] = []
+        seen = set()
+        current = session_id
+        depth = 0
+        while current and current not in seen and depth < max_depth:
+            chain.append(current)
+            seen.add(current)
+            state = self._sessions.get(current)
+            if state is None:
+                break
+            current = state.parent_session_id
+            depth += 1
+        return chain
+
+    @staticmethod
+    def _lcp_len(a: List[int], b: Tuple[int, ...]) -> int:
+        limit = min(len(a), len(b))
+        idx = 0
+        while idx < limit and a[idx] == b[idx]:
+            idx += 1
+        return idx
+
+    @staticmethod
+    def _append_unique_bounded(queue: deque, key_tuple: Tuple[int, ...], limit: int) -> None:
+        try:
+            queue.remove(key_tuple)
+        except ValueError:
+            pass
+        queue.append(key_tuple)
+        while len(queue) > limit:
+            queue.popleft()
+
+    def register_cache_key(self, session_ctx: SessionContext, cache_key: List[int]) -> None:
+        self._prune_idle()
+        session_id = (session_ctx.session_id or "").strip()
+        if not session_id:
+            return
+
+        state = self._sessions.get(session_id)
+        if state is None:
+            state = self.SessionState(
+                parent_session_id=session_ctx.parent_session_id,
+                touched_at=time.time(),
+                keys=deque(),
+                anchors=deque(),
+            )
+            self._sessions[session_id] = state
+
+        if session_ctx.parent_session_id and session_ctx.parent_session_id != session_id:
+            state.parent_session_id = session_ctx.parent_session_id
+        state.touched_at = time.time()
+
+        key_tuple = tuple(cache_key)
+        self._append_unique_bounded(state.keys, key_tuple, self._max_entries_per_session)
+
+        # Keep additional anchor prefixes so branch returns can reuse older stable
+        # points even when recent keys are from another branch/tool-heavy turn.
+        should_add_anchor = False
+        if not state.anchors:
+            should_add_anchor = True
+        else:
+            last_anchor_len = len(state.anchors[-1])
+            if (len(key_tuple) - last_anchor_len) >= self._anchor_stride_tokens:
+                should_add_anchor = True
+        if should_add_anchor:
+            self._append_unique_bounded(state.anchors, key_tuple, self._max_anchor_entries)
+
+    def _selection_from_exact_entry(
+        self,
+        prompt_tokens: List[int],
+        cache_tokens: Tuple[int, ...],
+        cache_entry: Any,
+    ):
+        prefix_len = self._lcp_len(prompt_tokens, cache_tokens)
+        if prefix_len <= 0:
+            return None
+
+        if len(cache_tokens) > prefix_len:
+            if not can_trim_prompt_cache(cache_entry.prompt_cache):
+                return None
+            trim_prompt_cache(cache_entry.prompt_cache, len(cache_tokens) - prefix_len)
+
+        if prefix_len == len(prompt_tokens):
+            if len(prompt_tokens) > 1 and can_trim_prompt_cache(cache_entry.prompt_cache):
+                trim_prompt_cache(cache_entry.prompt_cache, 1)
+                return (
+                    cache_entry.prompt_cache,
+                    prompt_tokens[-1:],
+                    list(cache_tokens),
+                    "exact",
+                    len(prompt_tokens) - 1,
+                )
+            return (
+                cache_entry.prompt_cache,
+                prompt_tokens,
+                list(cache_tokens),
+                "exact",
+                len(prompt_tokens),
+            )
+
+        return (
+            cache_entry.prompt_cache,
+            prompt_tokens[prefix_len:],
+            list(cache_tokens),
+            "shorter",
+            prefix_len,
+        )
+
+    def select_best_cache(
+        self,
+        model_name: str,
+        prompt_tokens: List[int],
+        session_ctx: SessionContext,
+        prompt_cache_store: LRUPromptCache,
+    ):
+        prompt_cache_store.prune_expired()
+        self._prune_idle()
+        if not SETTINGS.cache_session_partitioning:
+            selected = prompt_cache_store.fetch_nearest_cache(model_name, prompt_tokens)
+            return (*selected, "global_no_partition")
+
+        best = None
+        chain = self._lineage_chain(session_ctx.session_id)
+        for depth, sid in enumerate(chain):
+            state = self._sessions.get(sid)
+            if state is None:
+                continue
+            state.touched_at = time.time()
+            # Search fresh keys first, then long-lived anchors.
+            candidates: List[Tuple[int, ...]] = []
+            seen_candidates = set()
+            for cache_tokens in list(reversed(state.keys)) + list(reversed(state.anchors)):
+                if cache_tokens in seen_candidates:
+                    continue
+                seen_candidates.add(cache_tokens)
+                candidates.append(cache_tokens)
+
+            for recency_rank, cache_tokens in enumerate(candidates):
+                if not prompt_cache_store.contains_tokens(model_name, cache_tokens):
+                    continue
+                prefix_len = self._lcp_len(prompt_tokens, cache_tokens)
+                if prefix_len <= 0:
+                    continue
+                score = (prefix_len, -depth, -recency_rank)
+                if best is None or score > best["score"]:
+                    best = {
+                        "score": score,
+                        "cache_tokens": cache_tokens,
+                        "depth": depth,
+                        "session_id": sid,
+                    }
+
+        if best is not None:
+            cache_entry = prompt_cache_store.extract_exact_cache(model_name, best["cache_tokens"])
+            if cache_entry is not None:
+                selection = self._selection_from_exact_entry(
+                    prompt_tokens=prompt_tokens,
+                    cache_tokens=best["cache_tokens"],
+                    cache_entry=cache_entry,
+                )
+                if selection is not None:
+                    source = (
+                        "session_local"
+                        if best["depth"] == 0
+                        else f"session_ancestor_depth_{best['depth']}"
+                    )
+                    return (*selection, source)
+
+        selected = prompt_cache_store.fetch_nearest_cache(model_name, prompt_tokens)
+        return (*selected, "global_fallback")
+
+
+SESSION_INDEX = SessionIndex(
+    max_entries_per_session=SETTINGS.prompt_cache_max_entries_per_session,
+    max_idle_seconds=SETTINGS.prompt_cache_session_max_idle_seconds,
 )
 
 
@@ -388,6 +700,14 @@ class CacheSessionTranscriptLogger:
 def _cache_session_id(tokens: List[int]) -> str:
     raw = ",".join(str(tok) for tok in tokens[:1024])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _cache_log_session_id(session_ctx: SessionContext, cache_session_tokens: List[int]) -> str:
+    # Prefer stable conversation/session identifier for grouped diagnostics.
+    session_raw = (session_ctx.session_id or "").strip()
+    if session_raw:
+        return hashlib.sha1(session_raw.encode("utf-8")).hexdigest()[:16]
+    return _cache_session_id(cache_session_tokens)
 
 def _flatten_content(content):
     if isinstance(content, str):
@@ -701,7 +1021,97 @@ def _normalize_prompt_for_cache(prompt):
     """
     if not isinstance(prompt, str):
         return prompt
-    return INBOUND_META_MESSAGE_ID_PATTERN.sub(r'\1__CACHE_STABLE_MESSAGE_ID__\2', prompt)
+    if not SETTINGS.cache_canonicalize_tool_context:
+        return prompt
+    normalized = INBOUND_META_MESSAGE_ID_PATTERN.sub(
+        r'\1__CACHE_STABLE_MESSAGE_ID__\2',
+        prompt,
+    )
+    if INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN.search(normalized):
+        normalized = INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN.sub(
+            CACHE_STABLE_INBOUND_CONTEXT_BLOCK,
+            normalized,
+            count=1,
+        )
+    elif "# Project Context" in normalized:
+        normalized = normalized.replace(
+            "# Project Context",
+            f"{CACHE_STABLE_INBOUND_CONTEXT_BLOCK}\n# Project Context",
+            1,
+        )
+    normalized = INBOUND_CONTEXT_TO_PROJECT_BOUNDARY_PATTERN.sub(
+        r"\1\n# Project Context",
+        normalized,
+        count=1,
+    )
+    return normalized
+
+
+def _extract_session_context(body: Dict[str, Any], prompt_tokens: List[int]) -> SessionContext:
+    def _read_any_id(container: Optional[Dict[str, Any]], keys: List[str]) -> Optional[str]:
+        if not isinstance(container, dict):
+            return None
+        for key in keys:
+            value = container.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, (int, float)):
+                return str(value)
+        return None
+
+    metadata = body.get("metadata")
+    extra_body = body.get("extra_body")
+
+    id_keys = [
+        "session_id",
+        "conversation_id",
+        "thread_id",
+        "chat_id",
+        "conversation",
+        "session",
+    ]
+    parent_keys = [
+        "parent_session_id",
+        "parent_id",
+        "source_session_id",
+        "origin_session_id",
+    ]
+    branch_keys = ["branch_id", "branch", "subsession_id", "subagent_id"]
+
+    session_id = (
+        _read_any_id(body, id_keys)
+        or _read_any_id(metadata, id_keys)
+        or _read_any_id(extra_body, id_keys)
+    )
+    parent_session_id = (
+        _read_any_id(body, parent_keys)
+        or _read_any_id(metadata, parent_keys)
+        or _read_any_id(extra_body, parent_keys)
+    )
+    branch_id = (
+        _read_any_id(body, branch_keys)
+        or _read_any_id(metadata, branch_keys)
+        or _read_any_id(extra_body, branch_keys)
+    )
+
+    source = "request"
+    if not session_id:
+        raw = ",".join(str(tok) for tok in prompt_tokens[:128])
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+        session_id = f"implicit-{digest}"
+        source = "derived_from_prompt_prefix"
+
+    if parent_session_id == session_id:
+        parent_session_id = None
+
+    return SessionContext(
+        session_id=session_id,
+        parent_session_id=parent_session_id,
+        branch_id=branch_id,
+        source=source,
+    )
 
 
 def _build_sampler(body):
@@ -837,6 +1247,18 @@ atexit.register(cleanup)
 _terminal_status("🚀", f"Loading model: {SETTINGS.model_path}")
 model, tokenizer = load(SETTINGS.model_path, tokenizer_config={"trust_remote_code": True})
 _terminal_status("✅", "Model loaded.")
+_terminal_status(
+    "🧠",
+    (
+        "Cache config loaded | "
+        f"global_entries={SETTINGS.prompt_cache_max_entries_global} | "
+        f"per_session_entries={SETTINGS.prompt_cache_max_entries_per_session} | "
+        f"ttl_seconds={SETTINGS.prompt_cache_ttl_seconds} | "
+        f"session_idle_seconds={SETTINGS.prompt_cache_session_max_idle_seconds} | "
+        f"session_partitioning={SETTINGS.cache_session_partitioning} | "
+        f"canonicalize_tool_context={SETTINGS.cache_canonicalize_tool_context}"
+    ),
+)
 
 
 def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
@@ -916,6 +1338,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         cache_prompt = _normalize_prompt_for_cache(prompt)
         prompt_tokens = _tokenize_prompt(cache_prompt)
+        session_ctx = _extract_session_context(body, prompt_tokens)
         prompt_was_normalized = cache_prompt != prompt
         cache_key = prompt_tokens[:]
         prompt_cache = None
@@ -923,6 +1346,7 @@ class APIHandler(BaseHTTPRequestHandler):
         cache_session_tokens = prompt_tokens
         cache_match_type = "miss"
         matched_prefix_len = 0
+        cache_selection_source = "none"
         rest_count = len(prompt_tokens)
         request_logger = None
         sampler, sampler_kwargs = _build_sampler(body)
@@ -940,14 +1364,24 @@ class APIHandler(BaseHTTPRequestHandler):
             generation_started_at = time.time()
             wait_seconds = generation_started_at - queue_started_at
             with prompt_cache_lock:
-                prompt_cache, rest_tokens, cache_session_tokens, cache_match_type, matched_prefix_len = PROMPT_CACHE.fetch_nearest_cache(
-                    SETTINGS.model_path, prompt_tokens
+                (
+                    prompt_cache,
+                    rest_tokens,
+                    cache_session_tokens,
+                    cache_match_type,
+                    matched_prefix_len,
+                    cache_selection_source,
+                ) = SESSION_INDEX.select_best_cache(
+                    model_name=SETTINGS.model_path,
+                    prompt_tokens=prompt_tokens,
+                    session_ctx=session_ctx,
+                    prompt_cache_store=PROMPT_CACHE,
                 )
             if prompt_cache is None:
                 prompt_cache = make_prompt_cache(model, max_kv_size=SETTINGS.max_kv_size)
                 rest_tokens = prompt_tokens
             rest_count = len(rest_tokens) if rest_tokens is not None else len(prompt_tokens)
-            cache_session_id = _cache_session_id(cache_session_tokens)
+            cache_session_id = _cache_log_session_id(session_ctx, cache_session_tokens)
             if SETTINGS.enable_request_logging:
                 try:
                     request_logger = CacheSessionTranscriptLogger(cache_session_id=cache_session_id)
@@ -970,9 +1404,14 @@ class APIHandler(BaseHTTPRequestHandler):
                             "thinking_raw": reasoning_control["raw"],
                             "cache_session_id": cache_session_id,
                             "cache_match_type": cache_match_type,
+                            "cache_selection_source": cache_selection_source,
                             "matched_prefix_len": matched_prefix_len,
                             "cache_prompt_normalized": prompt_was_normalized,
                             "prompt_tokens": len(prompt_tokens),
+                            "session_id": session_ctx.session_id,
+                            "parent_session_id": session_ctx.parent_session_id,
+                            "branch_id": session_ctx.branch_id,
+                            "session_source": session_ctx.source,
                         },
                         "messages": messages,
                         "tools": tools,
@@ -997,7 +1436,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"prefix_tokens={matched_prefix_len} | rest_tokens={rest_count} | "
                 f"normalized={prompt_was_normalized} | "
                 f"thinking={enable_thinking} ({reasoning_control['source']}) | "
-                f"family={SETTINGS.model_family}",
+                f"family={SETTINGS.model_family} | session={session_ctx.session_id} ({cache_selection_source})",
             )
             _terminal_status(
                 "⚙️",
@@ -1037,6 +1476,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
                     PROMPT_CACHE.insert_cache(SETTINGS.model_path, cache_key, prompt_cache)
+                    SESSION_INDEX.register_cache_key(session_ctx, cache_key)
 
                 response_id = f"chatcmpl-{int(time.time())}"
                 full_response = {
@@ -1128,6 +1568,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
                     PROMPT_CACHE.insert_cache(SETTINGS.model_path, cache_key, prompt_cache)
+                    SESSION_INDEX.register_cache_key(session_ctx, cache_key)
 
                 if message_text:
                     chunk = {
