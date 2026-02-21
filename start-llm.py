@@ -198,7 +198,7 @@ def _build_settings() -> Settings:
         default_repetition_context_size=_env_int("DEFAULT_REPETITION_CONTEXT_SIZE", 256),
         default_max_tokens=_env_int("DEFAULT_MAX_TOKENS", 2048),
         enable_request_logging=_env_bool("ENABLE_REQUEST_LOGGING", True),
-        normalize_write_tool_content_for_prompt=_env_bool("NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", True),
+        normalize_write_tool_content_for_prompt=_env_bool("NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", False),
         cache_canonicalize_tool_context=_env_bool_any(
             ["CACHE_CANONICALIZE_TOOL_CONTEXT"],
             True,
@@ -1014,6 +1014,39 @@ def _tokenize_prompt(prompt):
     return list(prompt)
 
 
+def _insert_cache_entries(
+    model_name: str,
+    session_ctx: "SessionContext",
+    cache_key: List[int],
+    prompt_cache: Any,
+    generated_tokens: List[int],
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """
+    Insert the standard full-turn cache entry and, for tool-call turns, also
+    insert a prompt-only checkpoint. The checkpoint helps next-turn prefix reuse
+    when provider-side tool-call serialization differs between turns.
+    """
+    if (
+        tool_calls
+        and generated_tokens
+        and can_trim_prompt_cache(prompt_cache)
+        and len(cache_key) > len(generated_tokens)
+    ):
+        try:
+            prompt_only_cache = copy.deepcopy(prompt_cache)
+            trim_prompt_cache(prompt_only_cache, len(generated_tokens))
+            prompt_only_key = cache_key[: -len(generated_tokens)]
+            PROMPT_CACHE.insert_cache(model_name, prompt_only_key, prompt_only_cache)
+            SESSION_INDEX.register_cache_key(session_ctx, prompt_only_key)
+        except Exception:
+            # Non-fatal fallback: keep normal cache behavior.
+            pass
+
+    PROMPT_CACHE.insert_cache(model_name, cache_key, prompt_cache)
+    SESSION_INDEX.register_cache_key(session_ctx, cache_key)
+
+
 def _normalize_prompt_for_cache(prompt):
     """
     Normalize volatile, non-semantic metadata that changes every request
@@ -1475,8 +1508,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 finish_reason = "tool_calls" if tool_calls else "stop"
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
-                    PROMPT_CACHE.insert_cache(SETTINGS.model_path, cache_key, prompt_cache)
-                    SESSION_INDEX.register_cache_key(session_ctx, cache_key)
+                    _insert_cache_entries(
+                        model_name=SETTINGS.model_path,
+                        session_ctx=session_ctx,
+                        cache_key=cache_key,
+                        prompt_cache=prompt_cache,
+                        generated_tokens=generated_tokens,
+                        tool_calls=tool_calls,
+                    )
 
                 response_id = f"chatcmpl-{int(time.time())}"
                 full_response = {
@@ -1567,8 +1606,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
-                    PROMPT_CACHE.insert_cache(SETTINGS.model_path, cache_key, prompt_cache)
-                    SESSION_INDEX.register_cache_key(session_ctx, cache_key)
+                    _insert_cache_entries(
+                        model_name=SETTINGS.model_path,
+                        session_ctx=session_ctx,
+                        cache_key=cache_key,
+                        prompt_cache=prompt_cache,
+                        generated_tokens=generated_tokens,
+                        tool_calls=tool_calls,
+                    )
 
                 if message_text:
                     chunk = {
