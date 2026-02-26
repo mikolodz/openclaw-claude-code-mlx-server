@@ -18,9 +18,29 @@ from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dotenv import load_dotenv
+import mlx.core as mx
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.models.cache import make_prompt_cache, can_trim_prompt_cache, trim_prompt_cache
+
+# Optional VLM support (Blaizzy/mlx-vlm). If unavailable, is_vlm is always False.
+try:
+    import mlx_vlm
+    from mlx_vlm import load as load_vlm
+    from mlx_vlm import stream_generate as stream_generate_vlm
+    from mlx_vlm.utils import load_config as load_vlm_config
+    from mlx_vlm.utils import prepare_inputs as vlm_prepare_inputs
+    from mlx_vlm.utils import load_image as vlm_load_image
+    from mlx_vlm.prompt_utils import get_chat_template
+    mlx_vlm_available = True
+except ImportError:
+    mlx_vlm_available = False
+    load_vlm = None
+    stream_generate_vlm = None
+    load_vlm_config = None
+    vlm_prepare_inputs = None
+    vlm_load_image = None
+    get_chat_template = None
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DOTENV_PATH = SCRIPT_DIR / ".env"
@@ -214,6 +234,66 @@ def _build_settings() -> Settings:
 
 
 SETTINGS = _build_settings()
+
+# VLM model_type whitelist (from mlx-vlm prompt_utils / supported architectures).
+VLM_MODEL_TYPES = frozenset({
+    "qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe",
+    "qwen3_5", "qwen3_5_moe", "qwen3_omni_moe",
+    "glm4v", "glm4v_moe", "glm_ocr",
+    "llava", "llava_next", "llava_qwen2", "llava_bunny",
+    "idefics2", "idefics3", "mistral3",
+    "gemma3", "gemma3n", "pixtral",
+    "deepseek_vl_v2", "deepseekocr", "deepseekocr_2",
+    "aya_vision", "cohere2_vision", "internvl_chat",
+    "kimi_vl", "molmo", "molmo2", "smolvlm",
+    "jina_vlm", "jvlm", "phi3_v", "paligemma",
+    "florence2", "multi_modality", "mllama", "llama4",
+    "dots_ocr", "paddleocr_vl", "ernie4_5_moe_vl",
+    "lfm2_vl", "hunyuan_vl", "bunny-llama",
+})
+
+
+def _resolve_model_path_and_config():
+    """Resolve MODEL_PATH to a local directory and load config.json. Returns (path, config dict or None)."""
+    path_str = SETTINGS.model_path
+    path = Path(path_str)
+    if path.exists() and path.is_dir():
+        config_path = path / "config.json"
+        if config_path.exists():
+            try:
+                with open(config_path, encoding="utf-8") as f:
+                    return path, json.load(f)
+            except Exception:
+                return path, None
+        return path, None
+    if mlx_vlm_available:
+        try:
+            from huggingface_hub import snapshot_download
+            path = Path(snapshot_download(repo_id=path_str, allow_patterns=["*.json", "*.safetensors", "*.model", "*.tiktoken", "*.py", "*.jinja"]))
+            config_path = path / "config.json"
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    return path, json.load(f)
+            return path, None
+        except Exception:
+            pass
+    return None, None
+
+
+def _is_vlm_config(config: Optional[Dict[str, Any]]) -> bool:
+    """True if config indicates a VLM (vision) model."""
+    if not config or not mlx_vlm_available:
+        return False
+    model_type = (config.get("model_type") or "").strip().lower()
+    if model_type in VLM_MODEL_TYPES:
+        return True
+    if config.get("vision_config"):
+        return True
+    archs = config.get("architectures") or []
+    if any("VL" in str(a) or "Vision" in str(a) for a in archs):
+        return True
+    return False
+
 
 # GLOBAL LOCK: Prevents concurrent GPU access (Fixes the crash)
 model_lock = threading.Lock()
@@ -779,6 +859,136 @@ def _prepare_messages_for_template(messages):
         normalized.append(m)
     return normalized
 
+
+def _messages_have_images(messages: List[Dict[str, Any]]) -> bool:
+    """True if any message has content list containing image_url or input_image."""
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict):
+                t = (part.get("type") or "").strip().lower()
+                if t in ("image_url", "input_image"):
+                    return True
+                if "image_url" in part or "input_image" in part:
+                    return True
+    return False
+
+
+def _extract_images_from_messages(messages: List[Dict[str, Any]]) -> List[Any]:
+    """
+    Extract image sources from OpenAI-style content (type image_url / input_image).
+    Returns list in message order (data URL strings or PIL Images for prepare_inputs).
+    """
+    import base64
+    from io import BytesIO
+    images = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            url = None
+            if part.get("type") == "image_url":
+                u = part.get("image_url") or {}
+                url = u.get("url") if isinstance(u, dict) else None
+            elif part.get("type") == "input_image":
+                u = part.get("input_image") or part.get("image_url") or {}
+                url = u.get("url") if isinstance(u, dict) else u if isinstance(u, str) else None
+            if not url or not isinstance(url, str):
+                continue
+            url = url.strip()
+            if url.startswith("data:image/") and "," in url:
+                try:
+                    _, b64 = url.split(",", 1)
+                    from PIL import Image
+                    img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+                    images.append(img)
+                except Exception:
+                    images.append(url)
+            else:
+                images.append(url)
+    return images
+
+
+def _prepare_messages_for_vlm(messages: List[Dict[str, Any]], tools: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """
+    Normalize messages for VLM: fix tool_calls like _prepare_messages_for_template,
+    but preserve content as list (text + image_url) so get_chat_template can insert image tokens.
+    """
+    normalized = []
+    for msg in messages:
+        m = dict(msg)
+        content = m.get("content", "")
+        if isinstance(content, list):
+            new_content = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = (part.get("text") or part.get("content") or "")
+                    if SETTINGS.cache_canonicalize_tool_context:
+                        text = _normalize_prompt_for_cache(text)
+                    new_content.append({**part, "text": text})
+                else:
+                    new_content.append(part)
+            m["content"] = new_content
+        elif isinstance(content, str):
+            if SETTINGS.cache_canonicalize_tool_context:
+                m["content"] = _normalize_prompt_for_cache(content)
+            else:
+                m["content"] = content
+        if m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list):
+            fixed_tool_calls = []
+            for tc in m["tool_calls"]:
+                tc_copy = dict(tc)
+                fn = tc_copy.get("function")
+                if isinstance(fn, dict):
+                    fn_copy = dict(fn)
+                    args = fn_copy.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            fn_copy["arguments"] = json.loads(args)
+                        except Exception:
+                            fn_copy["arguments"] = {"raw": args}
+                    tc_copy["function"] = fn_copy
+                fixed_tool_calls.append(tc_copy)
+            m["tool_calls"] = fixed_tool_calls
+        normalized.append(m)
+    return normalized
+
+
+def _vlm_prompt_and_inputs(processor_any, config: Dict[str, Any], messages: List[Dict[str, Any]], images: List[Any], tools: Optional[Any] = None) -> Tuple[Any, Any, Any]:
+    """
+    Build formatted prompt and run prepare_inputs for VLM.
+    Returns (input_ids, pixel_values, mask) where input_ids is mx.array; mask may be None.
+    """
+    formatted = get_chat_template(
+        processor_any,
+        messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    if isinstance(formatted, list):
+        formatted = formatted[0].get("content", "") if formatted else ""
+    if not isinstance(formatted, str):
+        formatted = str(formatted)
+    inputs = vlm_prepare_inputs(
+        processor_any,
+        images=images if images else None,
+        prompts=formatted,
+        add_special_tokens=True,
+        return_tensors="mlx",
+    )
+    input_ids = inputs.get("input_ids")
+    pixel_values = inputs.get("pixel_values")
+    mask = inputs.get("attention_mask")
+    if input_ids is not None and hasattr(input_ids, "tolist"):
+        input_ids = input_ids  # keep mx.array for now; convert to list where needed
+    return input_ids, pixel_values, mask
+
+
 def _should_enable_thinking(body):
     if isinstance(body.get("enable_thinking"), bool):
         return body["enable_thinking"]
@@ -1277,9 +1487,71 @@ def cleanup():
 
 atexit.register(cleanup)
 
+# Model loading: LM or VLM based on config.
+model = None
+tokenizer = None
+processor = None
+is_vlm = False
+vlm_config = None
+
 _terminal_status("🚀", f"Loading model: {SETTINGS.model_path}")
-model, tokenizer = load(SETTINGS.model_path, tokenizer_config={"trust_remote_code": True})
-_terminal_status("✅", "Model loaded.")
+_resolved_path, _config = _resolve_model_path_and_config()
+if _config and _is_vlm_config(_config):
+    if not mlx_vlm_available:
+        raise RuntimeError(
+            "Model config indicates a VLM but mlx-vlm is not installed. "
+            "Install with: pip install mlx-vlm (and optionally mlx-vlm[torch] for some models)."
+        )
+    # Workaround: when torchvision is missing, transformers sets VIDEO_PROCESSOR_MAPPING_NAMES
+    # values to None, then video_processor_class_from_name does "class_name in extractors"
+    # and raises TypeError. Patch to skip None so processor can load (image-only path).
+    try:
+        import importlib
+        from transformers.models.auto import video_processing_auto as _vpa
+        from transformers.models.auto.configuration_auto import model_type_to_module_name
+
+        def _patched_video_processor_class_from_name(class_name: str):
+            for module_name, extractors in _vpa.VIDEO_PROCESSOR_MAPPING_NAMES.items():
+                if extractors is not None and class_name in extractors:
+                    mod_name = model_type_to_module_name(module_name)
+                    module = importlib.import_module(f".{mod_name}", "transformers.models")
+                    try:
+                        return getattr(module, class_name)
+                    except AttributeError:
+                        continue
+            for extractor in _vpa.VIDEO_PROCESSOR_MAPPING._extra_content.values():
+                if getattr(extractor, "__name__", None) == class_name:
+                    return extractor
+            main_module = importlib.import_module("transformers")
+            if hasattr(main_module, class_name):
+                return getattr(main_module, class_name)
+            return None
+
+        _vpa.video_processor_class_from_name = _patched_video_processor_class_from_name
+    except Exception:
+        pass
+    model, processor = load_vlm(SETTINGS.model_path, tokenizer_config={"trust_remote_code": True})
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    is_vlm = True
+    vlm_config = _config if isinstance(_config, dict) else getattr(model, "config", None)
+    if vlm_config is None and hasattr(model, "config"):
+        vlm_config = getattr(model.config, "__dict__", None) or {}
+    _terminal_status("✅", "VLM model loaded (mlx-vlm).")
+    try:
+        from transformers.utils import is_torchvision_available
+        if is_torchvision_available():
+            _terminal_status("⚡", "Torch acceleration: enabled (fast image/video processor).")
+        else:
+            _terminal_status(
+                "⚠️",
+                "Torch acceleration: disabled. Install mlx-vlm[torch] for much faster image processing.",
+            )
+    except Exception:
+        _terminal_status("⚠️", "Torch acceleration: unknown (torch/torchvision not detected).")
+else:
+    model, tokenizer = load(SETTINGS.model_path, tokenizer_config={"trust_remote_code": True})
+    _terminal_status("✅", "Model loaded (mlx-lm).")
+    _terminal_status("⚡", "Torch acceleration: N/A (text-only model).")
 _terminal_status(
     "🧠",
     (
@@ -1308,6 +1580,33 @@ def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
     if SETTINGS.kv_bits is not None:
         kwargs["kv_bits"] = SETTINGS.kv_bits
     return kwargs
+
+
+def _stream_generate_unified(rest_tokens, max_tokens, sampler, prompt_cache, vlm_pixel_values=None, vlm_mask=None, cache_match_type="miss"):
+    """
+    Yields response objects with .text and .token (LM: GenerationResponse, VLM: GenerationResult).
+    For VLM, pixel_values/mask are only passed on cache miss so vision is not re-run on decode.
+    """
+    if is_vlm:
+        use_vision = cache_match_type == "miss" and vlm_pixel_values is not None
+        rest_ids = mx.array([rest_tokens], dtype=mx.int32) if rest_tokens else mx.array([[0]], dtype=mx.int32)
+        kwargs = {
+            "input_ids": rest_ids,
+            "pixel_values": vlm_pixel_values if use_vision else None,
+            "mask": vlm_mask if use_vision else None,
+            "prompt_cache": prompt_cache,
+            "max_tokens": max_tokens,
+            "sampler": sampler,
+            "max_kv_size": SETTINGS.max_kv_size,
+            "kv_group_size": SETTINGS.kv_group_size,
+        }
+        if SETTINGS.kv_bits is not None:
+            kwargs["kv_bits"] = SETTINGS.kv_bits
+        for resp in stream_generate_vlm(model, processor, "", image=None, **kwargs):
+            yield resp
+    else:
+        for resp in stream_generate(**_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)):
+            yield resp
 
 class APIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -1353,26 +1652,47 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         request_id = uuid.uuid4().hex[:12]
-        messages = _prepare_messages_for_template(body.get("messages", []))
         tools = body.get("tools")
         reasoning_control = _extract_enable_thinking(body)
         enable_thinking = reasoning_control["enable_thinking"]
 
-        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                tools=tools,
-                enable_thinking=enable_thinking,
-            )
-        else:
-            prompt = messages[-1]["content"] if messages else ""
+        vlm_pixel_values = None
+        vlm_mask = None
+        vlm_input_ids_raw = None
 
-        cache_prompt = _normalize_prompt_for_cache(prompt)
-        prompt_tokens = _tokenize_prompt(cache_prompt)
+        if is_vlm:
+            messages = _prepare_messages_for_vlm(body.get("messages", []), tools=tools)
+            images = _extract_images_from_messages(body.get("messages", []))
+            vlm_input_ids_raw, vlm_pixel_values, vlm_mask = _vlm_prompt_and_inputs(
+                processor, vlm_config or {}, messages, images, tools=tools
+            )
+            if vlm_input_ids_raw is not None:
+                if hasattr(vlm_input_ids_raw, "flatten"):
+                    prompt_tokens = vlm_input_ids_raw.flatten().tolist()
+                else:
+                    prompt_tokens = list(vlm_input_ids_raw)
+            else:
+                prompt_tokens = []
+            prompt = ""
+        else:
+            messages = _prepare_messages_for_template(body.get("messages", []))
+            if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    enable_thinking=enable_thinking,
+                )
+            else:
+                prompt = messages[-1]["content"] if messages else ""
+            cache_prompt = _normalize_prompt_for_cache(prompt)
+            prompt_tokens = _tokenize_prompt(cache_prompt)
+            prompt_was_normalized = cache_prompt != prompt
+
         session_ctx = _extract_session_context(body, prompt_tokens)
-        prompt_was_normalized = cache_prompt != prompt
+        if is_vlm:
+            prompt_was_normalized = bool(SETTINGS.cache_canonicalize_tool_context)
         cache_key = prompt_tokens[:]
         prompt_cache = None
         rest_tokens = prompt_tokens
@@ -1411,7 +1731,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt_cache_store=PROMPT_CACHE,
                 )
             if prompt_cache is None:
-                prompt_cache = make_prompt_cache(model, max_kv_size=SETTINGS.max_kv_size)
+                cache_model = model.language_model if is_vlm and hasattr(model, "language_model") else model
+                prompt_cache = make_prompt_cache(cache_model, max_kv_size=SETTINGS.max_kv_size)
                 rest_tokens = prompt_tokens
             rest_count = len(rest_tokens) if rest_tokens is not None else len(prompt_tokens)
             cache_session_id = _cache_log_session_id(session_ctx, cache_session_tokens)
@@ -1485,7 +1806,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 generated_parts = []
                 progress_last_at = time.time()
-                for response in stream_generate(**_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)):
+                for response in _stream_generate_unified(
+                    rest_tokens, max_tokens, sampler, prompt_cache,
+                    vlm_pixel_values=vlm_pixel_values, vlm_mask=vlm_mask, cache_match_type=cache_match_type,
+                ):
                     generated_parts.append(response.text)
                     generated_tokens.append(int(response.token))
                     if first_token_at is None:
@@ -1581,7 +1905,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 raw_parts = []
                 progress_last_at = time.time()
-                for response in stream_generate(**_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)):
+                for response in _stream_generate_unified(
+                    rest_tokens, max_tokens, sampler, prompt_cache,
+                    vlm_pixel_values=vlm_pixel_values, vlm_mask=vlm_mask, cache_match_type=cache_match_type,
+                ):
                     generated_tokens.append(int(response.token))
                     if first_token_at is None:
                         first_token_at = time.time()
