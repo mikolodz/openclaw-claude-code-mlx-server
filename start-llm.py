@@ -166,6 +166,7 @@ class Settings:
     default_repetition_context_size: int
     default_max_tokens: int
     enable_request_logging: bool
+    default_thinking: bool
     vlm_cache_debug: bool
     normalize_write_tool_content_for_prompt: bool
     cache_canonicalize_tool_context: bool
@@ -234,6 +235,7 @@ def _build_settings() -> Settings:
         default_repetition_context_size=_env_int("DEFAULT_REPETITION_CONTEXT_SIZE", 256),
         default_max_tokens=_env_int("DEFAULT_MAX_TOKENS", 2048),
         enable_request_logging=_env_bool("ENABLE_REQUEST_LOGGING", True),
+        default_thinking=_env_bool("DEFAULT_THINKING", True),
         vlm_cache_debug=_env_bool("VLM_CACHE_DEBUG", False),
         normalize_write_tool_content_for_prompt=_env_bool("NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", False),
         cache_canonicalize_tool_context=_env_bool_any(
@@ -542,7 +544,17 @@ class LRUPromptCache:
     def fetch_nearest_cache(self, model, tokens):
         self.prune_expired()
         tokens_tup = tuple(tokens)
-        
+
+        # Fast path: exact-token key lookup is O(1) and avoids scanning large
+        # candidate sets in block index under multi-session workloads.
+        exact_key = (model, tokens_tup)
+        if exact_key in self._entries:
+            entry = self._extract(model, tokens_tup)
+            if len(tokens_tup) > 1 and can_trim_prompt_cache(entry.prompt_cache):
+                trim_prompt_cache(entry.prompt_cache, 1)
+                return entry.prompt_cache, tokens_tup[-1:], tokens_tup, "exact", len(tokens_tup) - 1
+            return entry.prompt_cache, [], tokens_tup, "exact", len(tokens_tup)
+
         # 1. Hash the incoming request into blocks
         chain_pairs = _block_chain_hashes(tokens_tup, self.block_size)
         if not chain_pairs:
@@ -550,57 +562,59 @@ class LRUPromptCache:
 
         best_prefix_len = 0
         best_cached_tokens = None
-        
-        # 2. Walk the blocks BACKWARDS to find the longest matching chain hash instantly
+
+        # 2. Walk blocks backwards. Keep this intentionally simple/fast:
+        # first matching candidate wins for the longest matched block.
         for chain_hash, req_prefix_len in reversed(chain_pairs):
             idx_key = (model, chain_hash)
             if idx_key in self._block_index:
-                # We found active cache entries containing this exact block prefix
                 candidate_tokens_set = self._block_index[idx_key]
                 for candidate_tokens in candidate_tokens_set:
-                    # Double-check exact token match up to prefix_len to avoid SHA256 collisions
                     if tokens_tup[:req_prefix_len] == candidate_tokens[:req_prefix_len]:
                         best_prefix_len = req_prefix_len
                         best_cached_tokens = candidate_tokens
                         break
-            
             if best_cached_tokens is not None:
-                break # Found the longest block match
+                break
 
         # 3. If no block matched, return miss
         if best_cached_tokens is None:
             return None, tokens, tokens, "miss", 0
 
-        # 4. We found a match. Extract the cache entry.
+        # 4. Extract selected cache entry
         entry = self._extract(model, best_cached_tokens)
 
-        # 5. Check if remaining tokens within the current block also match
+        # 5. Extend match inside the current block
         while best_prefix_len < min(len(tokens_tup), len(best_cached_tokens)):
             if tokens_tup[best_prefix_len] == best_cached_tokens[best_prefix_len]:
                 best_prefix_len += 1
             else:
                 break
 
-        # 6. Return the sliced/trimmed cache
+        # 6. Return sliced/trimmed cache
         if best_prefix_len == len(tokens_tup):
-            # Exact Match
+            # Request is fully covered by selected cache. If selected cache key is
+            # longer (prompt+completion), trim to request length first.
+            if len(best_cached_tokens) > len(tokens_tup):
+                if not can_trim_prompt_cache(entry.prompt_cache):
+                    return None, tokens, tokens, "miss", 0
+                trim_prompt_cache(entry.prompt_cache, len(best_cached_tokens) - len(tokens_tup))
             if len(tokens_tup) > 1 and can_trim_prompt_cache(entry.prompt_cache):
                 trim_prompt_cache(entry.prompt_cache, 1)
                 return entry.prompt_cache, tokens_tup[-1:], best_cached_tokens, "exact", len(tokens_tup) - 1
-            return entry.prompt_cache, tokens_tup, best_cached_tokens, "exact", len(tokens_tup)
-            
-        elif best_prefix_len < len(tokens_tup):
+            return entry.prompt_cache, [], best_cached_tokens, "exact", len(tokens_tup)
+
+        if best_prefix_len < len(tokens_tup):
             # Shorter Match (We have the prefix, compute the rest)
             if can_trim_prompt_cache(entry.prompt_cache):
                 trim_prompt_cache(entry.prompt_cache, len(best_cached_tokens) - best_prefix_len)
             return entry.prompt_cache, list(tokens_tup)[best_prefix_len:], best_cached_tokens, "shorter", best_prefix_len
 
-        elif best_prefix_len > len(tokens_tup):
-            # Longer cache: request is a prefix of cached; trim cache to request length
-            if can_trim_prompt_cache(entry.prompt_cache):
-                num_to_trim = len(best_cached_tokens) - len(tokens_tup)
-                trim_prompt_cache(entry.prompt_cache, num_to_trim)
-                return entry.prompt_cache, [], best_cached_tokens, "longer", len(tokens_tup)
+        # Longer cache: request is a strict prefix of cached; trim cache to request length
+        if can_trim_prompt_cache(entry.prompt_cache):
+            num_to_trim = len(best_cached_tokens) - len(tokens_tup)
+            trim_prompt_cache(entry.prompt_cache, num_to_trim)
+            return entry.prompt_cache, [], best_cached_tokens, "longer", len(tokens_tup)
         return None, tokens, tokens, "miss", 0
 
     def insert_cache(self, model, tokens, prompt_cache):
@@ -1327,8 +1341,8 @@ def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
 def _should_enable_thinking(body):
     if isinstance(body.get("enable_thinking"), bool):
         return body["enable_thinking"]
-    # Default to disabled to avoid long/self-referential planning loops unless explicitly requested.
-    return False
+    # Default to enabled
+    return SETTINGS.default_thinking
 
 
 def _reasoning_level_to_enable_thinking(value: Any) -> Optional[bool]:
@@ -2028,7 +2042,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self):
-        if self.path == "/v1/models":
+        if self.path.rstrip("/") in ("/v1/models", "/models"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -2051,10 +2065,10 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Not Found")
 
     def do_POST(self):
-        if self.path == "/v1/models":
+        if self.path.rstrip("/") in ("/v1/models", "/models"):
             return self.do_GET()
 
-        if self.path != "/v1/chat/completions":
+        if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
             self.send_error(404, "Not Found")
             return
 
