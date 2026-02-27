@@ -11,6 +11,7 @@ import uuid
 import hashlib
 import sys
 import shutil
+import signal
 from datetime import datetime
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -57,7 +58,7 @@ DOTENV_PATH = SCRIPT_DIR / ".env"
 # Thread-local VLM diagnostics (used_prefix_stable, etc.) for cache-debug logging.
 _vlm_diagnostics = threading.local()
 if DOTENV_PATH.exists():
-    load_dotenv(dotenv_path=DOTENV_PATH)
+    load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
 
 def _env_str(name: str, default: str) -> str:
@@ -875,7 +876,7 @@ def _vlm_stable_session_key(messages: List[Dict[str, Any]]) -> str:
     for msg in messages[:2]:
         role = (msg.get("role") or "").strip()
         content = _flatten_content(msg.get("content", ""))
-        parts.append(f"{role}:{content[:4096]}")
+        parts.append(f"{role}:{content}")
     raw = "\n".join(parts)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
@@ -981,6 +982,7 @@ def _vlm_build_stitched_prompt_tokens(
     def _tokenize_segment(seg: str, add_special_tokens: bool) -> List[int]:
         if not seg:
             return []
+        seg = _vlm_normalize_thinking_newlines(seg)
         if tokenizer.bos_token is None or not add_special_tokens:
             return tokenizer.encode(seg, add_special_tokens=add_special_tokens)
         return tokenizer.encode(seg, add_special_tokens=add_special_tokens)
@@ -1730,8 +1732,70 @@ def _build_sampler(body):
                 # Unknown failure mode, use minimal safe sampler.
                 return make_sampler(temp=temperature), {"temp": temperature}
 
+
+def _find_pids_listening_on_port(port: int) -> List[int]:
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []
+    if result.returncode not in (0, 1):
+        return []
+    pids: List[int] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid = int(line)
+        except ValueError:
+            continue
+        if pid != os.getpid():
+            pids.append(pid)
+    return pids
+
+
+def _stop_stale_litellm_on_proxy_port(port: int) -> None:
+    pids = _find_pids_listening_on_port(port)
+    if not pids:
+        return
+    stopped_any = False
+    for pid in pids:
+        cmdline = ""
+        try:
+            ps_result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            cmdline = ps_result.stdout.strip().lower()
+        except Exception:
+            pass
+        if "litellm" not in cmdline:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped_any = True
+            time.sleep(0.2)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                continue
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            continue
+    if stopped_any:
+        _terminal_status("♻️", f"Stopped stale LiteLLM process(es) on port {port} before restart.")
+
+
 def start_litellm_proxy():
     global proxy_process, proxy_config_path
+    _stop_stale_litellm_on_proxy_port(SETTINGS.proxy_port)
     _terminal_status("🌉", f"Launching LiteLLM Proxy on port {SETTINGS.proxy_port}...")
 
     # Use proxy config so unsupported OpenAI params (e.g. "store") are dropped.
@@ -1804,7 +1868,7 @@ litellm_settings:
             "LiteLLM proxy failed to start. "
             + (f"stderr: {stderr_output.strip()}" if stderr_output else "No stderr captured.")
         )
-    _terminal_status("✅", f"LiteLLM Proxy ready at http://127.0.0.1:{SETTINGS.proxy_port}")
+    _terminal_status("✅", f"LiteLLM Proxy ready at http://127.0.0.1:{SETTINGS.proxy_port} (model: {SETTINGS.proxy_model_id})")
 
 def cleanup():
     global proxy_config_path
@@ -1828,7 +1892,7 @@ processor = None
 is_vlm = False
 vlm_config = None
 
-_terminal_status("🚀", f"Loading model: {SETTINGS.model_path}")
+_terminal_status("🚀", f"Loading model: {SETTINGS.model_path} (exposed as: {SETTINGS.proxy_model_id})")
 _resolved_path, _config = _resolve_model_path_and_config()
 if _config and _is_vlm_config(_config):
     if not mlx_vlm_available:
@@ -1974,7 +2038,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         "object": "list",
                         "data": [
                             {
-                                "id": SETTINGS.model_path,
+                                "id": SETTINGS.proxy_model_id,
                                 "object": "model",
                                 "created": int(time.time()),
                                 "owned_by": "mlx",
@@ -2157,6 +2221,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         acquired = False
         generated_tokens = []
+        message_text = ""
         generation_started_at = None
         first_token_at = None
         queue_started_at = time.time()
@@ -2199,7 +2264,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         "request_meta": {
                             "path": self.path,
                             "stream": bool(body.get("stream", False)),
-                            "model": body.get("model", SETTINGS.model_path),
+                            "model": body.get("model", SETTINGS.proxy_model_id),
                             "model_family": SETTINGS.model_family,
                             "temperature": body.get("temperature", SETTINGS.default_temperature),
                             "max_tokens": body.get("max_tokens", SETTINGS.default_max_tokens),
@@ -2318,7 +2383,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     "id": response_id,
                     "object": "chat.completion",
                     "created": int(time.time()),
-                    "model": SETTINGS.model_path,
+                    "model": SETTINGS.proxy_model_id,
                     "choices": [{
                         "index": 0,
                         "message": {
@@ -2369,7 +2434,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     "id": response_id,
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
-                    "model": SETTINGS.model_path,
+                    "model": SETTINGS.proxy_model_id,
                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                 }
                 self.wfile.write(f"data: {json.dumps(role_chunk)}\n\n".encode("utf-8"))
@@ -2432,7 +2497,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         "id": response_id,
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
-                        "model": SETTINGS.model_path,
+                        "model": SETTINGS.proxy_model_id,
                         "choices": [{"index": 0, "delta": {"content": message_text}, "finish_reason": None}],
                     }
                     self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
@@ -2444,7 +2509,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             "id": response_id,
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
-                            "model": SETTINGS.model_path,
+                            "model": SETTINGS.proxy_model_id,
                             "choices": [{
                                 "index": 0,
                                 "delta": {"tool_calls": [{**tc, "index": idx}]},
@@ -2459,7 +2524,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     "id": response_id,
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
-                    "model": SETTINGS.model_path,
+                    "model": SETTINGS.proxy_model_id,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
                 }
                 self.wfile.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
@@ -2499,6 +2564,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 elapsed = max(end_at - generation_started_at, 1e-9)
                 output_tokens = len(generated_tokens)
                 speed = output_tokens / elapsed if output_tokens else 0.0
+                
+                non_reasoning_tokens = len(_tokenize_prompt(message_text)) if message_text else 0
+                reasoning_tokens = max(0, output_tokens - non_reasoning_tokens)
+                token_breakdown = f"{output_tokens} (reasoning: {reasoning_tokens}, output: {non_reasoning_tokens})" if enable_thinking else f"{output_tokens}"
+
                 if first_token_at is not None:
                     prefill_seconds = first_token_at - generation_started_at
                     decode_seconds = max(end_at - first_token_at, 1e-9)
@@ -2507,7 +2577,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     _terminal_status(
                         "✅",
                         (
-                            f"Request {request_id} finished | output_tokens={output_tokens} | "
+                            f"Request {request_id} finished | output_tokens={token_breakdown} | "
                             f"elapsed={elapsed:.2f}s | tok/s={speed:.2f} | "
                             f"prefill={prefill_seconds:.2f}s ({prefill_tps:.0f} tok/s) | "
                             f"decode={decode_seconds:.2f}s ({decode_tps:.1f} tok/s)"
@@ -2518,7 +2588,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     _terminal_status(
                         "✅",
                         (
-                            f"Request {request_id} finished | output_tokens={output_tokens} | "
+                            f"Request {request_id} finished | output_tokens={token_breakdown} | "
                             f"elapsed={elapsed:.2f}s | tok/s={speed:.2f}"
                         ),
                         indent=1,
@@ -2538,7 +2608,7 @@ def run():
     print("🟢 SYSTEM READY")
     print(f"   • Mode:         {'VLM (vision)' if is_vlm else 'LM (text-only)'}")
     print(f"   • MLX Engine:   http://{SETTINGS.mlx_host}:{SETTINGS.mlx_port}")
-    print(f"   • OpenClaw Link: http://127.0.0.1:{SETTINGS.proxy_port}")
+    print(f"   • LiteLLM:      http://127.0.0.1:{SETTINGS.proxy_port}")
     print("=" * 50 + "\n")
 
     try:
