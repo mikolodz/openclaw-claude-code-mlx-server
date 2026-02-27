@@ -12,12 +12,21 @@ import hashlib
 import sys
 import shutil
 from datetime import datetime
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dotenv import load_dotenv
+
+# --- THE METAL CRASH FIX (CPU QUARANTINE) ---
+import torch
+# Blindfold PyTorch so it never touches the Apple Silicon GPU (MPS).
+# This forces torchvision to use the CPU, preventing Metal Command Buffer
+# collisions with MLX during massive OpenClaw prefills.
+torch.backends.mps.is_built = lambda: False
+# --------------------------------------------
+
 import mlx.core as mx
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
@@ -44,6 +53,9 @@ except ImportError:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DOTENV_PATH = SCRIPT_DIR / ".env"
+
+# Thread-local VLM diagnostics (used_prefix_stable, etc.) for cache-debug logging.
+_vlm_diagnostics = threading.local()
 if DOTENV_PATH.exists():
     load_dotenv(dotenv_path=DOTENV_PATH)
 
@@ -153,9 +165,12 @@ class Settings:
     default_repetition_context_size: int
     default_max_tokens: int
     enable_request_logging: bool
+    vlm_cache_debug: bool
     normalize_write_tool_content_for_prompt: bool
     cache_canonicalize_tool_context: bool
     cache_session_partitioning: bool
+    prompt_cache_block_size: int
+    cache_use_block_index: bool
     log_root: Path
     proxy_startup_wait_seconds: float
     proxy_model_id: str
@@ -218,6 +233,7 @@ def _build_settings() -> Settings:
         default_repetition_context_size=_env_int("DEFAULT_REPETITION_CONTEXT_SIZE", 256),
         default_max_tokens=_env_int("DEFAULT_MAX_TOKENS", 2048),
         enable_request_logging=_env_bool("ENABLE_REQUEST_LOGGING", True),
+        vlm_cache_debug=_env_bool("VLM_CACHE_DEBUG", False),
         normalize_write_tool_content_for_prompt=_env_bool("NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", False),
         cache_canonicalize_tool_context=_env_bool_any(
             ["CACHE_CANONICALIZE_TOOL_CONTEXT"],
@@ -225,6 +241,11 @@ def _build_settings() -> Settings:
         ),
         cache_session_partitioning=_env_bool_any(
             ["CACHE_SESSION_PARTITIONING"],
+            True,
+        ),
+        prompt_cache_block_size=_env_int("PROMPT_CACHE_BLOCK_SIZE", 16),
+        cache_use_block_index=_env_bool_any(
+            ["CACHE_USE_BLOCK_INDEX"],
             True,
         ),
         log_root=Path(_env_str("LOG_ROOT", str(SCRIPT_DIR / "logs"))),
@@ -281,13 +302,14 @@ def _resolve_model_path_and_config():
 
 
 def _is_vlm_config(config: Optional[Dict[str, Any]]) -> bool:
-    """True if config indicates a VLM (vision) model."""
+    """True if config indicates a VLM (vision) model. Prefer exact model_type to avoid text-only (e.g. Qwen3-Coder) being misclassified."""
     if not config or not mlx_vlm_available:
         return False
     model_type = (config.get("model_type") or "").strip().lower()
     if model_type in VLM_MODEL_TYPES:
         return True
-    if config.get("vision_config"):
+    vc = config.get("vision_config")
+    if isinstance(vc, dict) and len(vc) > 0:
         return True
     archs = config.get("architectures") or []
     if any("VL" in str(a) or "Vision" in str(a) for a in archs):
@@ -327,6 +349,54 @@ CACHE_STABLE_INBOUND_CONTEXT_BLOCK = (
 INBOUND_CONTEXT_TO_PROJECT_BOUNDARY_PATTERN = re.compile(
     r"(__CACHE_STABLE_INBOUND_CONTEXT__)\n+# Project Context"
 )
+# Strip reasoning from response content when returning to client (so reasoning is hidden).
+# Full think blocks (<think>...</think>) and "orphan" </think> (reasoning with no opening tag, e.g. GLM-style).
+THINK_TAG_STRIP_PATTERN = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+# Orphan </think>: content from start up to and including </think> so we hide reasoning when model
+# outputs "reasoning text</think>\n\nanswer" without a leading <think> tag.
+THINK_ORPHAN_CLOSE_PATTERN = re.compile(r"^.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking_from_content(text: str) -> str:
+    """Remove <think>...</think> blocks and leading content up to orphan </think> so reasoning is hidden."""
+    if not isinstance(text, str):
+        return text
+    # First remove full think blocks.
+    out = THINK_TAG_STRIP_PATTERN.sub("", text)
+    # Then remove any leading reasoning that ends with </think> but has no <think> (e.g. GLM / Qwen VLM).
+    out = THINK_ORPHAN_CLOSE_PATTERN.sub("", out, count=1)
+    return out.strip()
+
+
+# Session store of full assistant content (with <think>) for VLM cache-key stability.
+# Key (model_path, session_id) -> last full assistant text. Client sends stripped content;
+# we substitute stored full content when building the next prompt so cache keys match.
+SESSION_FULL_ASSISTANT: OrderedDict = OrderedDict()
+SESSION_FULL_ASSISTANT_LOCK = threading.Lock()
+MAX_SESSION_FULL_ASSISTANT = 500
+
+# Token trajectory store: exact token IDs per assistant turn for cache-key stitching.
+# Key (model_path, stable_session_key) -> list of token ID lists, one per assistant turn.
+# When building the next request we stitch tokenize(prefix) + stored_turn_ids + tokenize(suffix)
+# so the token sequence matches the stored KV cache (no re-tokenization divergence).
+TOKEN_TRAJECTORY_STORE: OrderedDict = OrderedDict()
+TOKEN_TRAJECTORY_STORE_LOCK = threading.Lock()
+MAX_TRAJECTORY_TURNS_PER_CONVERSATION = 64
+MAX_TRAJECTORY_CONVERSATIONS = 500
+
+
+def _token_trajectory_append(key: Tuple[str, str], generated_tokens: List[int]) -> None:
+    """Append one assistant turn's token IDs to the trajectory store; evict if over cap."""
+    with TOKEN_TRAJECTORY_STORE_LOCK:
+        turns = TOKEN_TRAJECTORY_STORE.get(key, [])
+        turns = list(turns) if isinstance(turns, list) else []
+        turns.append(list(generated_tokens))
+        if len(turns) > MAX_TRAJECTORY_TURNS_PER_CONVERSATION:
+            turns = turns[-MAX_TRAJECTORY_TURNS_PER_CONVERSATION:]
+        TOKEN_TRAJECTORY_STORE[key] = turns
+        TOKEN_TRAJECTORY_STORE.move_to_end(key, last=True)
+        while len(TOKEN_TRAJECTORY_STORE) > MAX_TRAJECTORY_CONVERSATIONS:
+            TOKEN_TRAJECTORY_STORE.popitem(last=False)
 
 
 def _terminal_status(icon: str, message: str, indent: int = 0) -> None:
@@ -335,200 +405,240 @@ def _terminal_status(icon: str, message: str, indent: int = 0) -> None:
         pad = "  " * max(indent, 0)
         print(f"{pad}{icon} [{ts}] {message}", flush=True)
 
+def _debug_token_divergence(tokenizer, current_tokens: List[int], stored_tokens: Tuple[int, ...], context_window: int = 5):
+    """Finds and prints exactly where two token sequences diverge for cache debugging."""
+    min_len = min(len(current_tokens), len(stored_tokens))
+    diverge_idx = -1
+    
+    for i in range(min_len):
+        if current_tokens[i] != stored_tokens[i]:
+            diverge_idx = i
+            break
+            
+    if diverge_idx == -1:
+        if len(current_tokens) == len(stored_tokens):
+            _terminal_status("🔍", "DEBUG: Token sequences are completely identical!")
+        else:
+            _terminal_status("🔍", f"DEBUG: Perfect prefix match! Lengths: {len(current_tokens)} vs {len(stored_tokens)}")
+        return
+
+    # Calculate window bounds for context
+    start_idx = max(0, diverge_idx - context_window)
+    end_idx_current = min(len(current_tokens), diverge_idx + context_window + 1)
+    end_idx_stored = min(len(stored_tokens), diverge_idx + context_window + 1)
+
+    print(f"\n" + "="*50)
+    print(f"🚨 CACHE DIVERGENCE DETECTED AT INDEX {diverge_idx} 🚨")
+    print(f"Token IDs before divergence: {current_tokens[start_idx:diverge_idx]}")
+    
+    # Try to decode the text for human readability
+    try:
+        matching_text = tokenizer.decode(current_tokens[start_idx:diverge_idx])
+        print(f"Matching text leading up: {repr(matching_text)}")
+        
+        curr_divergent_token = current_tokens[diverge_idx]
+        stor_divergent_token = stored_tokens[diverge_idx]
+        print(f"\n❌ Current Request Token [{diverge_idx}]: ID {curr_divergent_token} -> {repr(tokenizer.decode([curr_divergent_token]))}")
+        print(f"❌ Stored Cache Token  [{diverge_idx}]: ID {stor_divergent_token} -> {repr(tokenizer.decode([stor_divergent_token]))}")
+        
+        curr_context_after = tokenizer.decode(current_tokens[diverge_idx+1:end_idx_current])
+        stor_context_after = tokenizer.decode(stored_tokens[diverge_idx+1:end_idx_stored])
+        print(f"\nCurrent context after: {repr(curr_context_after)}")
+        print(f"Stored context after:  {repr(stor_context_after)}")
+    except Exception as e:
+        print(f"Could not decode tokens: {e}")
+    print("="*50 + "\n")
+
+
+def _block_chain_hashes(
+    tokens: Tuple[int, ...],
+    block_size: int,
+) -> List[Tuple[bytes, int]]:
+    """Return [(chain_hash, prefix_len), ...] for each block prefix. chain_hash[i] = H(prev || block_i)."""
+    if block_size <= 0 or not tokens:
+        return []
+    out: List[Tuple[bytes, int]] = []
+    prev = b""
+    for i in range(0, len(tokens), block_size):
+        block = tokens[i : i + block_size]
+        block_bytes = b"".join(t.to_bytes(4, "big") for t in block)
+        h = hashlib.sha256(prev + block_bytes).digest()
+        prefix_len = min(i + block_size, len(tokens))
+        out.append((h, prefix_len))
+        prev = h
+    return out
+
 class LRUPromptCache:
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
+        tokens: Tuple[int, ...]
         count: int
         touched_at: float
-
-    @dataclass
-    class SearchResult:
-        model: Any
-        exact: List[int]
-        shorter: List[int]
-        longer: List[int]
-        common_prefix: int
-        matched_prefix_len: int = 0
 
     def __init__(self, max_size=10, ttl_seconds=1800):
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
-        self._cache = {}
+        # Force block size to a minimum of 16, overriding the disabled config
+        self.block_size = max(16, getattr(SETTINGS, "prompt_cache_block_size", 16))
+        
+        # 1. The Core Flat Cache: (model, exact_tokens) -> CacheEntry
+        self._entries: Dict[Tuple[str, Tuple[int, ...]], self.CacheEntry] = {}
+        
+        # 2. The Block Hash Index: (model, chain_hash) -> Set of token sequences containing this block
+        self._block_index: Dict[Tuple[str, bytes], set] = {}
+        
         self._lru = deque()
 
     def _is_expired(self, entry):
-        # TTL <= 0 means "no TTL expiry" (keep entries until LRU pressure).
         if self.ttl_seconds <= 0:
             return False
         return (time.time() - entry.touched_at) > self.ttl_seconds
 
-    def _prune_expired(self):
-        stale = []
-        for model, tokens in list(self._lru):
-            try:
-                entry = self._get(model, tokens)
-            except Exception:
-                continue
-            if self._is_expired(entry):
-                stale.append((model, tokens))
-        for model, tokens in stale:
-            try:
-                self._delete(model, tokens)
-            except Exception:
-                pass
-            try:
-                self._lru.remove((model, tokens))
-            except ValueError:
-                pass
-
     def prune_expired(self):
-        self._prune_expired()
-
-    def _search(self, model, tokens):
-        tokens = tuple(tokens)
-        if model not in self._cache:
-            return self.SearchResult(model, None, None, None, 0, 0)
-
-        current = self._cache[model]
-        last_cache_index = -1
-        index = 0
-
-        while index < len(tokens) and tokens[index] in current:
-            current = current[tokens[index]]
-            if "cache" in current:
-                last_cache_index = index
-            index += 1
-
-        if last_cache_index == len(tokens) - 1:
-            return self.SearchResult(model, tokens, None, None, 0, len(tokens))
-
-        shorter = None
-        if last_cache_index > 0:
-            shorter = tokens[: last_cache_index + 1]
-
-        longer = None
-        common_prefix = index
-        if index > 0 and last_cache_index <= 0:
-            best = None
-            stack = [(current, tuple())]
-            while stack:
-                node, extra = stack.pop()
-                if "cache" in node:
-                    if best is None or len(extra) < len(best):
-                        best = extra
-                else:
-                    for tok in node:
-                        stack.append((node[tok], extra + (tok,)))
-            if best is not None:
-                longer = tokens[:index] + best
-
-        matched_prefix_len = len(shorter) if shorter is not None else common_prefix
-        return self.SearchResult(model, None, shorter, longer, common_prefix, matched_prefix_len)
-
-    def _get(self, model, tokens):
-        tokens = tuple(tokens)
-        current = self._cache[model]
-        for tok in tokens:
-            current = current[tok]
-        return current["cache"]
+        now = time.time()
+        stale_keys = [k for k, v in self._entries.items() if self._is_expired(v)]
+        for k in stale_keys:
+            self._delete(k[0], k[1])
 
     def _delete(self, model, tokens):
-        tokens = tuple(tokens)
-        path = [self._cache[model]]
-        for tok in tokens:
-            path.append(path[-1][tok])
-        del path[-1]["cache"]
-        for i in reversed(range(len(tokens))):
-            prev_node, node, tok = path[i], path[i + 1], tokens[i]
-            if len(node) > 0:
-                break
-            del prev_node[tok]
+        key = (model, tuple(tokens))
+        if key not in self._entries:
+            return
+        
+        # Clean up the block index to prevent memory leaks
+        chain_pairs = _block_chain_hashes(tokens, self.block_size)
+        for chain_hash, _ in chain_pairs:
+            idx_key = (model, chain_hash)
+            if idx_key in self._block_index:
+                self._block_index[idx_key].discard(key[1])
+                if not self._block_index[idx_key]:
+                    del self._block_index[idx_key]
+                    
+        del self._entries[key]
+        try:
+            self._lru.remove(key)
+        except ValueError:
+            pass
 
     def _extract(self, model, tokens):
-        tokens = tuple(tokens)
-        entry = self._get(model, tokens)
+        key = (model, tuple(tokens))
+        entry = self._entries[key]
         entry.touched_at = time.time()
-        if entry.count == 1:
-            self._delete(model, tokens)
-            self._lru.remove((model, tokens))
-            return entry
-        entry.count -= 1
-        return self.CacheEntry(copy.deepcopy(entry.prompt_cache), 1, time.time())
-
-    def contains_tokens(self, model, tokens):
-        tokens = tuple(tokens)
-        if model not in self._cache:
-            return False
-        current = self._cache[model]
-        for tok in tokens:
-            if tok not in current:
-                return False
-            current = current[tok]
-        return "cache" in current
-
-    def extract_exact_cache(self, model, tokens):
-        tokens = tuple(tokens)
-        if not self.contains_tokens(model, tokens):
-            return None
-        return self._extract(model, tokens)
+        
+        # Never delete the cache on read. Multi-agent branching requires 
+        # the root prefix to remain alive in VRAM for other agents to share.
+        # The LRU pruner will safely handle VRAM limits.
+        
+        try:
+            self._lru.remove(key)
+        except ValueError:
+            pass
+        self._lru.append(key)
+        
+        return self.CacheEntry(copy.deepcopy(entry.prompt_cache), entry.tokens, entry.count, time.time())
 
     def fetch_nearest_cache(self, model, tokens):
-        """Returns (prompt_cache, rest_tokens, cache_session_tokens, cache_match_type, matched_prefix_len).
-        cache_match_type is one of 'exact', 'shorter', 'longer', 'miss'.
-        """
-        self._prune_expired()
-        result = self._search(model, tokens)
+        self.prune_expired()
+        tokens_tup = tuple(tokens)
+        
+        # 1. Hash the incoming request into blocks
+        chain_pairs = _block_chain_hashes(tokens_tup, self.block_size)
+        if not chain_pairs:
+            return None, tokens, tokens, "miss", 0
 
-        if result.exact is not None:
-            entry = self._extract(result.model, result.exact)
-            # Keep one token to continue decoding safely.
-            if len(tokens) > 1 and can_trim_prompt_cache(entry.prompt_cache):
+        best_prefix_len = 0
+        best_cached_tokens = None
+        
+        # 2. Walk the blocks BACKWARDS to find the longest matching chain hash instantly
+        for chain_hash, req_prefix_len in reversed(chain_pairs):
+            idx_key = (model, chain_hash)
+            if idx_key in self._block_index:
+                # We found active cache entries containing this exact block prefix
+                candidate_tokens_set = self._block_index[idx_key]
+                for candidate_tokens in candidate_tokens_set:
+                    # Double-check exact token match up to prefix_len to avoid SHA256 collisions
+                    if tokens_tup[:req_prefix_len] == candidate_tokens[:req_prefix_len]:
+                        best_prefix_len = req_prefix_len
+                        best_cached_tokens = candidate_tokens
+                        break
+            
+            if best_cached_tokens is not None:
+                break # Found the longest block match
+
+        # 3. If no block matched, return miss
+        if best_cached_tokens is None:
+            return None, tokens, tokens, "miss", 0
+
+        # 4. We found a match. Extract the cache entry.
+        entry = self._extract(model, best_cached_tokens)
+
+        # 5. Check if remaining tokens within the current block also match
+        while best_prefix_len < min(len(tokens_tup), len(best_cached_tokens)):
+            if tokens_tup[best_prefix_len] == best_cached_tokens[best_prefix_len]:
+                best_prefix_len += 1
+            else:
+                break
+
+        # 6. Return the sliced/trimmed cache
+        if best_prefix_len == len(tokens_tup):
+            # Exact Match
+            if len(tokens_tup) > 1 and can_trim_prompt_cache(entry.prompt_cache):
                 trim_prompt_cache(entry.prompt_cache, 1)
-                return entry.prompt_cache, tokens[-1:], result.exact, "exact", len(tokens) - 1
-            return entry.prompt_cache, tokens, result.exact, "exact", len(tokens)
+                return entry.prompt_cache, tokens_tup[-1:], best_cached_tokens, "exact", len(tokens_tup) - 1
+            return entry.prompt_cache, tokens_tup, best_cached_tokens, "exact", len(tokens_tup)
+            
+        elif best_prefix_len < len(tokens_tup):
+            # Shorter Match (We have the prefix, compute the rest)
+            if can_trim_prompt_cache(entry.prompt_cache):
+                trim_prompt_cache(entry.prompt_cache, len(best_cached_tokens) - best_prefix_len)
+            return entry.prompt_cache, list(tokens_tup)[best_prefix_len:], best_cached_tokens, "shorter", best_prefix_len
 
-        if result.shorter is not None:
-            entry = self._extract(result.model, result.shorter)
-            prefix_len = len(result.shorter)
-            return entry.prompt_cache, tokens[prefix_len:], result.shorter, "shorter", prefix_len
-
-        if result.longer is not None:
-            entry = self._get(result.model, result.longer)
-            if not can_trim_prompt_cache(entry.prompt_cache):
-                return None, tokens, tokens, "miss", 0
-            prefix = min(len(tokens) - 1, result.common_prefix)
-            # Avoid deepcopy: extract (remove from cache), then trim in place.
-            entry = self._extract(result.model, result.longer)
-            num_to_trim = len(result.longer) - prefix
-            trim_prompt_cache(entry.prompt_cache, num_to_trim)
-            return entry.prompt_cache, tokens[prefix:], result.longer, "longer", prefix
-
+        elif best_prefix_len > len(tokens_tup):
+            # Longer cache: request is a prefix of cached; trim cache to request length
+            if can_trim_prompt_cache(entry.prompt_cache):
+                num_to_trim = len(best_cached_tokens) - len(tokens_tup)
+                trim_prompt_cache(entry.prompt_cache, num_to_trim)
+                return entry.prompt_cache, [], best_cached_tokens, "longer", len(tokens_tup)
         return None, tokens, tokens, "miss", 0
 
     def insert_cache(self, model, tokens, prompt_cache):
-        tokens = tuple(tokens)
-        self._prune_expired()
-        if model not in self._cache:
-            self._cache[model] = {}
+        self.prune_expired()
+        tokens_tup = tuple(tokens)
+        key = (model, tokens_tup)
+        
+        if key in self._entries:
+            self._entries[key].count += 1
+            self._entries[key].touched_at = time.time()
+            self._lru.remove(key)
+            self._lru.append(key)
+            return
 
-        current = self._cache[model]
-        for tok in tokens:
-            if tok not in current:
-                current[tok] = {}
-            current = current[tok]
+        # Insert into flat dictionary
+        self._entries[key] = self.CacheEntry(prompt_cache, tokens_tup, 1, time.time())
+        
+        # Map every block hash to this token sequence
+        chain_pairs = _block_chain_hashes(tokens_tup, self.block_size)
+        for chain_hash, _ in chain_pairs:
+            idx_key = (model, chain_hash)
+            if idx_key not in self._block_index:
+                self._block_index[idx_key] = set()
+            self._block_index[idx_key].add(tokens_tup)
 
-        if "cache" in current:
-            current["cache"].count += 1
-            current["cache"].touched_at = time.time()
-            self._lru.remove((model, tokens))
-        else:
-            current["cache"] = self.CacheEntry(prompt_cache, 1, time.time())
-
-        self._lru.append((model, tokens))
+        self._lru.append(key)
+        
         if len(self._lru) > self.max_size:
-            old_model, old_tokens = self._lru.popleft()
-            self._delete(old_model, old_tokens)
+            old_key = self._lru.popleft()
+            self._delete(old_key[0], old_key[1])
+
+    def contains_tokens(self, model, tokens):
+        key = (model, tuple(tokens))
+        return key in self._entries
+
+    def extract_exact_cache(self, model, tokens):
+        if not self.contains_tokens(model, tokens):
+            return None
+        return self._extract(model, tuple(tokens))
 
 PROMPT_CACHE = LRUPromptCache(
     max_size=SETTINGS.prompt_cache_max_entries_global,
@@ -687,61 +797,11 @@ class SessionIndex:
         session_ctx: SessionContext,
         prompt_cache_store: LRUPromptCache,
     ):
+        """Always use global cache; session/conversation/thread ID is ignored for lookup."""
         prompt_cache_store.prune_expired()
         self._prune_idle()
-        if not SETTINGS.cache_session_partitioning:
-            selected = prompt_cache_store.fetch_nearest_cache(model_name, prompt_tokens)
-            return (*selected, "global_no_partition")
-
-        best = None
-        chain = self._lineage_chain(session_ctx.session_id)
-        for depth, sid in enumerate(chain):
-            state = self._sessions.get(sid)
-            if state is None:
-                continue
-            state.touched_at = time.time()
-            # Search fresh keys first, then long-lived anchors.
-            candidates: List[Tuple[int, ...]] = []
-            seen_candidates = set()
-            for cache_tokens in list(reversed(state.keys)) + list(reversed(state.anchors)):
-                if cache_tokens in seen_candidates:
-                    continue
-                seen_candidates.add(cache_tokens)
-                candidates.append(cache_tokens)
-
-            for recency_rank, cache_tokens in enumerate(candidates):
-                if not prompt_cache_store.contains_tokens(model_name, cache_tokens):
-                    continue
-                prefix_len = self._lcp_len(prompt_tokens, cache_tokens)
-                if prefix_len <= 0:
-                    continue
-                score = (prefix_len, -depth, -recency_rank)
-                if best is None or score > best["score"]:
-                    best = {
-                        "score": score,
-                        "cache_tokens": cache_tokens,
-                        "depth": depth,
-                        "session_id": sid,
-                    }
-
-        if best is not None:
-            cache_entry = prompt_cache_store.extract_exact_cache(model_name, best["cache_tokens"])
-            if cache_entry is not None:
-                selection = self._selection_from_exact_entry(
-                    prompt_tokens=prompt_tokens,
-                    cache_tokens=best["cache_tokens"],
-                    cache_entry=cache_entry,
-                )
-                if selection is not None:
-                    source = (
-                        "session_local"
-                        if best["depth"] == 0
-                        else f"session_ancestor_depth_{best['depth']}"
-                    )
-                    return (*selection, source)
-
         selected = prompt_cache_store.fetch_nearest_cache(model_name, prompt_tokens)
-        return (*selected, "global_fallback")
+        return (*selected, "global")
 
 
 SESSION_INDEX = SessionIndex(
@@ -789,6 +849,7 @@ def _cache_log_session_id(session_ctx: SessionContext, cache_session_tokens: Lis
         return hashlib.sha1(session_raw.encode("utf-8")).hexdigest()[:16]
     return _cache_session_id(cache_session_tokens)
 
+
 def _flatten_content(content):
     if isinstance(content, str):
         return content
@@ -801,6 +862,157 @@ def _flatten_content(content):
                 text_content += part
         return text_content
     return content
+
+
+def _vlm_stable_session_key(messages: List[Dict[str, Any]]) -> str:
+    """
+    Derive a stable session key from the first two messages (system + first user)
+    so that SESSION_FULL_ASSISTANT lookup/store matches across turns. Used when
+    session_id is implicit (derived from prompt_tokens), because for VLM we don't
+    have prompt_tokens yet when we need to look up the stored full assistant.
+    """
+    parts = []
+    for msg in messages[:2]:
+        role = (msg.get("role") or "").strip()
+        content = _flatten_content(msg.get("content", ""))
+        parts.append(f"{role}:{content[:4096]}")
+    raw = "\n".join(parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _vlm_assistant_block_wrapper(
+    processor_any: Any,
+    enable_thinking: bool,
+    model_family: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    Return (prefix, suffix) strings that wrap assistant content in the chat template.
+    Used for token trajectory stitching: we tokenize prefix + stored_turn_ids + suffix
+    so we never re-tokenize assistant content. Template-aware for Qwen; generic fallback.
+    """
+    family = (model_family or getattr(SETTINGS, "model_family", "") or "").strip().lower()
+    if family == "qwen3" or "qwen" in family:
+        # Qwen: <|im_start|>assistant\n then optional <think>\n then content then \n</think>\n<|im_end|>
+        prefix = "<|im_start|>assistant\n"
+        if enable_thinking:
+            prefix += "<think>\n"
+        suffix = "\n</think>\n<|im_end|>\n" if enable_thinking else "\n<|im_end|>\n"
+        return prefix, suffix
+    if family == "glm4":
+        # GLM4 VLM: similar structure; use generic if needed.
+        prefix = "<|assistant|>\n"
+        suffix = "\n"
+        return prefix, suffix
+    # Generic: minimal wrapper so tokenizer does not merge across boundaries.
+    prefix = "<|im_start|>assistant\n"
+    suffix = "\n<|im_end|>\n"
+    return prefix, suffix
+
+
+def _vlm_build_stitched_prompt_tokens(
+    processor_any: Any,
+    messages: List[Dict[str, Any]],
+    trajectory_turns: List[List[int]],
+    tools: Optional[Any],
+    enable_thinking: Optional[bool],
+    model_family: Optional[str] = None,
+) -> List[int]:
+    """
+    Build prompt token list by stitching tokenized segments with exact stored assistant
+    token IDs from TokenTrajectoryStore. Guarantees the token sequence matches the
+    stored KV cache from previous turns (no re-tokenization divergence).
+    """
+    template_processor = None
+    if processor_any is not None and hasattr(processor_any, "apply_chat_template"):
+        if getattr(processor_any, "chat_template", None) is not None:
+            template_processor = processor_any
+    if template_processor is None and getattr(processor_any, "tokenizer", None) is not None:
+        tok = processor_any.tokenizer
+        if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None) is not None:
+            template_processor = tok
+    if template_processor is None or not messages:
+        return []
+
+    tokenizer = getattr(processor_any, "tokenizer", processor_any)
+    template_kwargs: Dict[str, Any] = {}
+    if tools is not None:
+        template_kwargs["tools"] = tools
+    if enable_thinking is not None:
+        template_kwargs["enable_thinking"] = enable_thinking
+
+    def _apply(mes: List[Dict[str, Any]], gen: bool) -> str:
+        try:
+            raw = template_processor.apply_chat_template(
+                mes,
+                tokenize=False,
+                add_generation_prompt=gen,
+                **template_kwargs,
+            )
+        except Exception:
+            return ""
+        if isinstance(raw, list):
+            raw = raw[0] if raw else ""
+        return str(raw) if raw else ""
+
+    # Per-message segment strings (same logic as _vlm_format_prompt_prefix_stable).
+    parts: List[str] = []
+    try:
+        prev = _apply([], False)
+    except Exception:
+        prev = ""
+    for i in range(len(messages)):
+        s = _apply(messages[: i + 1], False)
+        if len(s) >= len(prev):
+            parts.append(s[len(prev) :])
+        else:
+            parts.append("")
+        prev = s
+    full_no_gen = prev
+    full_with_gen = _apply(messages, True)
+    if full_with_gen.startswith(full_no_gen) and len(full_with_gen) >= len(full_no_gen):
+        gen_suffix = full_with_gen[len(full_no_gen) :]
+    else:
+        gen_suffix = "\nAssistant:"
+
+    asst_prefix, asst_suffix = _vlm_assistant_block_wrapper(
+        processor_any, bool(enable_thinking), model_family
+    )
+
+    def _tokenize_segment(seg: str, add_special_tokens: bool) -> List[int]:
+        if not seg:
+            return []
+        if tokenizer.bos_token is None or not add_special_tokens:
+            return tokenizer.encode(seg, add_special_tokens=add_special_tokens)
+        return tokenizer.encode(seg, add_special_tokens=add_special_tokens)
+
+    out: List[int] = []
+    assistant_count = sum(1 for msg in messages if (msg.get("role") or "").strip().lower() == "assistant")
+    use_count = min(len(trajectory_turns), assistant_count)
+    trajectory_start_idx = assistant_count - use_count
+
+    assistant_idx = 0
+    first = True
+    for i, msg in enumerate(messages):
+        seg = parts[i] if i < len(parts) else ""
+        role = (msg.get("role") or "").strip().lower()
+        if role == "assistant":
+            if assistant_idx < trajectory_start_idx:
+                # Fallback: tokenize segment as-is (no stored trajectory).
+                out.extend(_tokenize_segment(seg, add_special_tokens=first))
+                first = False
+            else:
+                out.extend(_tokenize_segment(asst_prefix, add_special_tokens=first))
+                first = False
+                turn_idx = assistant_idx - trajectory_start_idx
+                out.extend(trajectory_turns[turn_idx])
+                out.extend(_tokenize_segment(asst_suffix, add_special_tokens=False))
+            assistant_idx += 1
+        else:
+            out.extend(_tokenize_segment(seg, add_special_tokens=first))
+            first = False
+    out.extend(_tokenize_segment(gen_suffix, add_special_tokens=False))
+    return out
+
 
 def _prepare_messages_for_template(messages):
     normalized = []
@@ -959,21 +1171,117 @@ def _prepare_messages_for_vlm(messages: List[Dict[str, Any]], tools: Optional[An
     return normalized
 
 
-def _vlm_prompt_and_inputs(processor_any, config: Dict[str, Any], messages: List[Dict[str, Any]], images: List[Any], tools: Optional[Any] = None) -> Tuple[Any, Any, Any]:
+def _vlm_normalize_thinking_newlines(formatted: str) -> str:
+    """
+    Best-effort canonicalize newlines after <think> and </think> for tokenization stability.
+    The canonical fix for cache-key divergence is Token Trajectory Stitching (stored
+    exact token IDs per assistant turn); this normalization is fallback when trajectory
+    is not used (e.g. first turn or eviction).
+    """
+    if not formatted:
+        return formatted
+    # After opening <think> or closing </think>, collapse any run of whitespace+newlines to single \\n
+    formatted = re.sub(r"(<think>)\s*\n+", r"\1\n", formatted)
+    formatted = re.sub(r"(</think>)\s*\n+", r"\1\n", formatted)
+    return formatted
+
+
+def _vlm_format_prompt_prefix_stable(
+    processor_any,
+    messages: List[Dict[str, Any]],
+    add_generation_prompt: bool = True,
+    **kwargs: Any,
+) -> str:
+    """
+    Build the chat-formatted prompt so that the prefix for the first K messages
+    is always the same token sequence regardless of how many messages follow.
+    This enables prompt-cache prefix reuse across turns (cache=shorter).
+    Falls back to get_chat_template if the processor has no apply_chat_template.
+    Pass tools= and enable_thinking= (and any other template kwargs) so output
+    matches the full template and cache prefixes align.
+    """
+    try:
+        _vlm_diagnostics.used_prefix_stable = False
+    except AttributeError:
+        pass
+    template_processor = None
+    if processor_any is not None and hasattr(processor_any, "apply_chat_template"):
+        if getattr(processor_any, "chat_template", None) is not None:
+            template_processor = processor_any
+    if template_processor is None and getattr(processor_any, "tokenizer", None) is not None:
+        tok = processor_any.tokenizer
+        if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None) is not None:
+            template_processor = tok
+    if template_processor is None or not messages:
+        out = get_chat_template(
+            processor_any,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=False,
+            **kwargs,
+        )
+        if isinstance(out, list):
+            out = out[0].get("content", "") if out else ""
+        return _vlm_normalize_thinking_newlines(str(out) if out else "")
+
+    _vlm_diagnostics.used_prefix_stable = True
+
+    def _apply(mes: List[Dict[str, Any]], gen: bool) -> str:
+        try:
+            raw = template_processor.apply_chat_template(
+                mes,
+                tokenize=False,
+                add_generation_prompt=gen,
+                **kwargs,
+            )
+        except Exception:
+            return ""
+        if isinstance(raw, list):
+            raw = raw[0] if raw else ""
+        return str(raw) if raw else ""
+
+    parts = []
+    try:
+        prev = _apply([], False)
+    except Exception:
+        prev = ""
+    for i in range(len(messages)):
+        s = _apply(messages[: i + 1], False)
+        if len(s) >= len(prev):
+            parts.append(s[len(prev) :])
+        prev = s
+    full_no_gen = prev
+    full_with_gen = _apply(messages, True)
+    if full_with_gen.startswith(full_no_gen) and len(full_with_gen) >= len(full_no_gen):
+        gen_suffix = full_with_gen[len(full_no_gen) :]
+    else:
+        gen_suffix = "\nAssistant:" if add_generation_prompt else ""
+    return _vlm_normalize_thinking_newlines("".join(parts) + gen_suffix)
+
+
+def _vlm_prompt_and_inputs(
+    processor_any,
+    config: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    images: List[Any],
+    tools: Optional[Any] = None,
+    enable_thinking: Optional[bool] = None,
+    **kwargs: Any,
+) -> Tuple[Any, Any, Any]:
     """
     Build formatted prompt and run prepare_inputs for VLM.
     Returns (input_ids, pixel_values, mask) where input_ids is mx.array; mask may be None.
+    Uses prefix-stable formatting so cache prefix reuse works across turns.
+    Pass tools= and enable_thinking= so the template output matches and cache aligns.
     """
-    formatted = get_chat_template(
-        processor_any,
-        messages,
-        add_generation_prompt=True,
-        tokenize=False,
+    template_kwargs = dict(kwargs)
+    if tools is not None:
+        template_kwargs["tools"] = tools
+    if enable_thinking is not None:
+        template_kwargs["enable_thinking"] = enable_thinking
+    formatted = _vlm_format_prompt_prefix_stable(
+        processor_any, messages, add_generation_prompt=True, **template_kwargs
     )
-    if isinstance(formatted, list):
-        formatted = formatted[0].get("content", "") if formatted else ""
-    if not isinstance(formatted, str):
-        formatted = str(formatted)
     inputs = vlm_prepare_inputs(
         processor_any,
         images=images if images else None,
@@ -987,6 +1295,31 @@ def _vlm_prompt_and_inputs(processor_any, config: Dict[str, Any], messages: List
     if input_ids is not None and hasattr(input_ids, "tolist"):
         input_ids = input_ids  # keep mx.array for now; convert to list where needed
     return input_ids, pixel_values, mask
+
+
+def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
+    """
+    Flush Metal work before VLM generation to prevent PyTorch and MLX from colliding.
+    """
+    try:
+        import torch
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.synchronize()
+            torch.mps.empty_cache() # CRITICAL: Force PyTorch to release all Metal encoders
+    except Exception:
+        pass
+        
+    to_eval = []
+    if pixel_values is not None and hasattr(pixel_values, "shape"):
+        to_eval.append(pixel_values)
+    if mask is not None and hasattr(mask, "shape"):
+        to_eval.append(mask)
+    if to_eval:
+        try:
+            import mlx.core as mx
+            mx.eval(*to_eval)
+        except Exception:
+            pass
 
 
 def _should_enable_thinking(body):
@@ -1237,9 +1570,11 @@ def _insert_cache_entries(
     insert a prompt-only checkpoint. The checkpoint helps next-turn prefix reuse
     when provider-side tool-call serialization differs between turns.
     """
+    # Always insert a prompt-only checkpoint when possible so the next turn can
+    # match this prefix (cache=shorter). Required for VLM prefix reuse when the
+    # session only has the full key (prompt+generated); also helps LM.
     if (
-        tool_calls
-        and generated_tokens
+        generated_tokens
         and can_trim_prompt_cache(prompt_cache)
         and len(cache_key) > len(generated_tokens)
     ):
@@ -1250,7 +1585,6 @@ def _insert_cache_entries(
             PROMPT_CACHE.insert_cache(model_name, prompt_only_key, prompt_only_cache)
             SESSION_INDEX.register_cache_key(session_ctx, prompt_only_key)
         except Exception:
-            # Non-fatal fallback: keep normal cache behavior.
             pass
 
     PROMPT_CACHE.insert_cache(model_name, cache_key, prompt_cache)
@@ -1540,7 +1874,11 @@ if _config and _is_vlm_config(_config):
     try:
         from transformers.utils import is_torchvision_available
         if is_torchvision_available():
-            _terminal_status("⚡", "Torch acceleration: enabled (fast image/video processor).")
+            _terminal_status(
+                "⚡",
+                "Torch acceleration: enabled (fast image/video processor). "
+                "If you see Metal 'uncommitted encoder' crash, try: pip install mlx-vlm (without [torch] extra).",
+            )
         else:
             _terminal_status(
                 "⚠️",
@@ -1560,7 +1898,7 @@ _terminal_status(
         f"per_session_entries={SETTINGS.prompt_cache_max_entries_per_session} | "
         f"ttl_seconds={SETTINGS.prompt_cache_ttl_seconds} | "
         f"session_idle_seconds={SETTINGS.prompt_cache_session_max_idle_seconds} | "
-        f"session_partitioning={SETTINGS.cache_session_partitioning} | "
+        "session_partitioning=False (global only) | "
         f"canonicalize_tool_context={SETTINGS.cache_canonicalize_tool_context}"
     ),
 )
@@ -1585,10 +1923,22 @@ def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
 def _stream_generate_unified(rest_tokens, max_tokens, sampler, prompt_cache, vlm_pixel_values=None, vlm_mask=None, cache_match_type="miss"):
     """
     Yields response objects with .text and .token (LM: GenerationResponse, VLM: GenerationResult).
-    For VLM, pixel_values/mask are only passed on cache miss so vision is not re-run on decode.
+    Dynamically checks for image tokens in rest_tokens to prevent Metal Segmentation Faults.
     """
     if is_vlm:
-        use_vision = cache_match_type == "miss" and vlm_pixel_values is not None
+        # Prevent Segfault: We MUST pass vision tensors if rest_tokens contains image placeholders.
+        # If we have a massive chunk of rest_tokens (e.g., > 100) on a 'shorter' hit, 
+        # it almost certainly contains the system/user image tokens.
+        has_image_tokens = False
+        if rest_tokens:
+            # Check for common Qwen3/GLM vision token IDs, or fallback to length heuristic
+            vision_tokens = {151652, 151653, 151654, 151655} # Common Qwen vision IDs
+            has_image_tokens = any(tok in vision_tokens for tok in rest_tokens)
+            if not has_image_tokens and len(rest_tokens) > 100:
+                has_image_tokens = True
+
+        use_vision = (cache_match_type == "miss" or has_image_tokens) and vlm_pixel_values is not None
+        
         rest_ids = mx.array([rest_tokens], dtype=mx.int32) if rest_tokens else mx.array([[0]], dtype=mx.int32)
         kwargs = {
             "input_ids": rest_ids,
@@ -1661,11 +2011,42 @@ class APIHandler(BaseHTTPRequestHandler):
         vlm_input_ids_raw = None
 
         if is_vlm:
-            messages = _prepare_messages_for_vlm(body.get("messages", []), tools=tools)
+            raw_messages = body.get("messages", [])
+            session_ctx_early = _extract_session_context(body, [])
+            stable_key = _vlm_stable_session_key(raw_messages) if raw_messages else None
+            key = (SETTINGS.model_path, stable_key) if stable_key else None
+            if (
+                enable_thinking
+                and len(raw_messages) > 0
+                and raw_messages[-1].get("role") == "assistant"
+            ):
+                # Use stable key from first two messages so lookup matches store across
+                # turns; implicit session_id is derived from prompt_tokens which we
+                # don't have yet for VLM.
+                with SESSION_FULL_ASSISTANT_LOCK:
+                    stored = SESSION_FULL_ASSISTANT.get(key)
+                # Use stored full assistant content when we have it so the tokenized prompt
+                # matches the previous turn's cache (client may send stripped/different wording).
+                use_stored = bool(stored)
+                if use_stored:
+                    messages_for_vlm = [dict(m) for m in raw_messages]
+                    messages_for_vlm[-1]["content"] = stored
+                    messages = _prepare_messages_for_vlm(messages_for_vlm, tools=tools)
+                else:
+                    messages = _prepare_messages_for_vlm(raw_messages, tools=tools)
+            else:
+                messages = _prepare_messages_for_vlm(raw_messages, tools=tools)
             images = _extract_images_from_messages(body.get("messages", []))
-            vlm_input_ids_raw, vlm_pixel_values, vlm_mask = _vlm_prompt_and_inputs(
-                processor, vlm_config or {}, messages, images, tools=tools
-            )
+            with model_lock:
+                vlm_input_ids_raw, vlm_pixel_values, vlm_mask = _vlm_prompt_and_inputs(
+                    processor,
+                    vlm_config or {},
+                    messages,
+                    images,
+                    tools=tools,
+                    enable_thinking=enable_thinking,
+                )
+                _vlm_sync_before_generation(vlm_pixel_values, vlm_mask)
             if vlm_input_ids_raw is not None:
                 if hasattr(vlm_input_ids_raw, "flatten"):
                     prompt_tokens = vlm_input_ids_raw.flatten().tolist()
@@ -1673,22 +2054,81 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt_tokens = list(vlm_input_ids_raw)
             else:
                 prompt_tokens = []
+            # Token trajectory stitching: when we have stored token IDs for every assistant
+            # turn, build prompt_tokens by stitching so the sequence matches the KV cache.
+            assistant_count = sum(
+                1 for m in messages if (m.get("role") or "").strip().lower() == "assistant"
+            )
+            if (
+                enable_thinking
+                and assistant_count > 0
+                and stable_key is not None
+            ):
+                with TOKEN_TRAJECTORY_STORE_LOCK:
+                    trajectory_list = list(TOKEN_TRAJECTORY_STORE.get(key, []))
+                if trajectory_list:
+                    use_count = min(len(trajectory_list), assistant_count)
+                    trajectory_turns = trajectory_list[-use_count:]
+                    stitched = _vlm_build_stitched_prompt_tokens(
+                        processor,
+                        messages,
+                        trajectory_turns,
+                        tools=tools,
+                        enable_thinking=enable_thinking,
+                        model_family=SETTINGS.model_family,
+                    )
+                    if stitched:
+                        prompt_tokens = stitched
+            # VLM cache key = this token list. We use _vlm_format_prompt_prefix_stable so
+            # the prefix for the first K messages tokenizes identically across turns (cache=shorter).
             prompt = ""
         else:
             messages = _prepare_messages_for_template(body.get("messages", []))
-            if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    tools=tools,
-                    enable_thinking=enable_thinking,
-                )
+            # Token trajectory stitching (LM path): stitch stored assistant token IDs when available
+            prompt_tokens = None
+            raw_messages_lm = body.get("messages", [])
+            stable_key_lm = _vlm_stable_session_key(raw_messages_lm) if raw_messages_lm else None
+            key_lm = (SETTINGS.model_path, stable_key_lm) if stable_key_lm else None
+            assistant_count_lm = sum(
+                1 for m in messages if (m.get("role") or "").strip().lower() == "assistant"
+            )
+            if (
+                enable_thinking
+                and assistant_count_lm > 0
+                and key_lm is not None
+            ):
+                with TOKEN_TRAJECTORY_STORE_LOCK:
+                    trajectory_list_lm = list(TOKEN_TRAJECTORY_STORE.get(key_lm, []))
+                if trajectory_list_lm:
+                    use_count_lm = min(len(trajectory_list_lm), assistant_count_lm)
+                    trajectory_turns_lm = trajectory_list_lm[-use_count_lm:]
+                    stitched_lm = _vlm_build_stitched_prompt_tokens(
+                        tokenizer,
+                        messages,
+                        trajectory_turns_lm,
+                        tools=tools,
+                        enable_thinking=enable_thinking,
+                        model_family=SETTINGS.model_family,
+                    )
+                    if stitched_lm:
+                        prompt_tokens = stitched_lm
+            if prompt_tokens is None:
+                if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+                    prompt = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        tools=tools,
+                        enable_thinking=enable_thinking,
+                    )
+                else:
+                    prompt = messages[-1]["content"] if messages else ""
+                cache_prompt = _normalize_prompt_for_cache(prompt)
+                prompt_tokens = _tokenize_prompt(cache_prompt)
+                prompt_was_normalized = cache_prompt != prompt
             else:
-                prompt = messages[-1]["content"] if messages else ""
-            cache_prompt = _normalize_prompt_for_cache(prompt)
-            prompt_tokens = _tokenize_prompt(cache_prompt)
-            prompt_was_normalized = cache_prompt != prompt
+                prompt = ""
+                prompt_was_normalized = False
 
         session_ctx = _extract_session_context(body, prompt_tokens)
         if is_vlm:
@@ -1706,6 +2146,15 @@ class APIHandler(BaseHTTPRequestHandler):
         max_tokens = body.get("max_tokens", SETTINGS.default_max_tokens)
         is_streaming = body.get("stream", False)
 
+        # --- INJECT DEBUG BLOCK HERE ---
+        if SETTINGS.vlm_cache_debug and session_ctx.session_id:
+            state = SESSION_INDEX._sessions.get(session_ctx.session_id)
+            if state and state.keys:
+                # Grab the most recent cache key for this session
+                most_recent_stored_key = state.keys[-1]
+                _debug_token_divergence(tokenizer, prompt_tokens, most_recent_stored_key, context_window=8)
+        # --- END INJECT DEBUG BLOCK ---
+
         acquired = False
         generated_tokens = []
         generation_started_at = None
@@ -1714,6 +2163,7 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             model_lock.acquire(blocking=True)
             acquired = True
+            
             generation_started_at = time.time()
             wait_seconds = generation_started_at - queue_started_at
             with prompt_cache_lock:
@@ -1766,6 +2216,16 @@ class APIHandler(BaseHTTPRequestHandler):
                             "parent_session_id": session_ctx.parent_session_id,
                             "branch_id": session_ctx.branch_id,
                             "session_source": session_ctx.source,
+                            **(
+                                {
+                                    "vlm_format_prefix_stable": getattr(
+                                        _vlm_diagnostics, "used_prefix_stable", False
+                                    ),
+                                    "prompt_token_prefix": list(prompt_tokens[:64]),
+                                }
+                                if is_vlm
+                                else {}
+                            ),
                         },
                         "messages": messages,
                         "tools": tools,
@@ -1773,15 +2233,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     },
                     request_id=request_id,
                 )
-                request_logger.log(
-                    "sampler",
-                    {
-                        "applied_kwargs": sampler_kwargs,
-                        "rest_tokens": rest_count,
-                        "matched_prefix_len": matched_prefix_len,
-                    },
-                    request_id=request_id,
-                )
+                sampler_payload = {
+                    "applied_kwargs": sampler_kwargs,
+                    "rest_tokens": rest_count,
+                    "matched_prefix_len": matched_prefix_len,
+                }
+                if SETTINGS.vlm_cache_debug and is_vlm and prompt_tokens:
+                    sampler_payload["prompt_token_prefix"] = list(prompt_tokens[:64])
+                request_logger.log("sampler", sampler_payload, request_id=request_id)
 
             _terminal_status(
                 "📨",
@@ -1829,6 +2288,19 @@ class APIHandler(BaseHTTPRequestHandler):
                 message_text, tool_calls = _extract_openai_tool_calls(
                     response_text, SETTINGS.model_family
                 )
+                # Hide <think> blocks from the client whenever reasoning was requested (LM or VLM).
+                if enable_thinking:
+                    message_text = _strip_thinking_from_content(message_text)
+                if enable_thinking:
+                    traj_key = (SETTINGS.model_path, _vlm_stable_session_key(body.get("messages", [])))
+                    _token_trajectory_append(traj_key, generated_tokens)
+                if is_vlm and enable_thinking:
+                    with SESSION_FULL_ASSISTANT_LOCK:
+                        traj_key = (SETTINGS.model_path, _vlm_stable_session_key(body.get("messages", [])))
+                        SESSION_FULL_ASSISTANT[traj_key] = raw_response_text
+                        SESSION_FULL_ASSISTANT.move_to_end(traj_key, last=True)
+                        while len(SESSION_FULL_ASSISTANT) > MAX_SESSION_FULL_ASSISTANT:
+                            SESSION_FULL_ASSISTANT.popitem(last=False)
                 finish_reason = "tool_calls" if tool_calls else "stop"
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
@@ -1931,6 +2403,19 @@ class APIHandler(BaseHTTPRequestHandler):
                 message_text, tool_calls = _extract_openai_tool_calls(
                     full_text, SETTINGS.model_family
                 )
+                # Hide <think> blocks from the client whenever reasoning was requested (LM or VLM).
+                if enable_thinking:
+                    message_text = _strip_thinking_from_content(message_text)
+                if enable_thinking:
+                    traj_key_stream = (SETTINGS.model_path, _vlm_stable_session_key(body.get("messages", [])))
+                    _token_trajectory_append(traj_key_stream, generated_tokens)
+                if is_vlm and enable_thinking:
+                    with SESSION_FULL_ASSISTANT_LOCK:
+                        traj_key_stream = (SETTINGS.model_path, _vlm_stable_session_key(body.get("messages", [])))
+                        SESSION_FULL_ASSISTANT[traj_key_stream] = raw_full_text
+                        SESSION_FULL_ASSISTANT.move_to_end(traj_key_stream, last=True)
+                        while len(SESSION_FULL_ASSISTANT) > MAX_SESSION_FULL_ASSISTANT:
+                            SESSION_FULL_ASSISTANT.popitem(last=False)
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
                     _insert_cache_entries(
@@ -2038,6 +2523,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         ),
                         indent=1,
                     )
+            # On normal exit or Python exception, release the lock. On process abort (e.g. Metal
+            # "uncommitted encoder" crash), finally may not run, so the "leaked semaphore" warning
+            # at shutdown is expected; fixing the Metal crash resolves it.
             if acquired:
                 model_lock.release()
 
@@ -2048,6 +2536,7 @@ def run():
 
     print("\n" + "=" * 50)
     print("🟢 SYSTEM READY")
+    print(f"   • Mode:         {'VLM (vision)' if is_vlm else 'LM (text-only)'}")
     print(f"   • MLX Engine:   http://{SETTINGS.mlx_host}:{SETTINGS.mlx_port}")
     print(f"   • OpenClaw Link: http://127.0.0.1:{SETTINGS.proxy_port}")
     print("=" * 50 + "\n")
