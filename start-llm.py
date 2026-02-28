@@ -460,27 +460,38 @@ def _debug_token_divergence(tokenizer, current_tokens: List[int], stored_tokens:
             diverge_idx = i
             break
 
-    # Calculate window bounds for context
+    # Limit how much we print: last few token IDs and short decoded snippets only
+    max_tokens_show = 10
+    max_text_len = 200
+
     start_idx = max(0, diverge_idx - context_window)
+    tokens_before = current_tokens[start_idx:diverge_idx]
+    if len(tokens_before) > max_tokens_show:
+        tokens_before = tokens_before[-max_tokens_show:]
     end_idx_current = min(len(current_tokens), diverge_idx + context_window + 1)
     end_idx_stored = min(len(stored_tokens), diverge_idx + context_window + 1)
 
     print(f"\n" + "="*50)
     print(f"🚨 CACHE DIVERGENCE DETECTED AT INDEX {diverge_idx} 🚨")
-    print(f"Token IDs before divergence: {current_tokens[start_idx:diverge_idx]}")
-    
-    # Try to decode the text for human readability
+    print(f"Token IDs before divergence (last {len(tokens_before)}): {tokens_before}")
+
     try:
         matching_text = tokenizer.decode(current_tokens[start_idx:diverge_idx])
+        if len(matching_text) > max_text_len:
+            matching_text = "..." + matching_text[-max_text_len:].strip()
         print(f"Matching text leading up: {repr(matching_text)}")
-        
+
         curr_divergent_token = current_tokens[diverge_idx]
         stor_divergent_token = stored_tokens[diverge_idx]
         print(f"\n❌ Current Request Token [{diverge_idx}]: ID {curr_divergent_token} -> {repr(tokenizer.decode([curr_divergent_token]))}")
         print(f"❌ Stored Cache Token  [{diverge_idx}]: ID {stor_divergent_token} -> {repr(tokenizer.decode([stor_divergent_token]))}")
-        
+
         curr_context_after = tokenizer.decode(current_tokens[diverge_idx+1:end_idx_current])
         stor_context_after = tokenizer.decode(stored_tokens[diverge_idx+1:end_idx_stored])
+        if len(curr_context_after) > max_text_len:
+            curr_context_after = curr_context_after[:max_text_len] + "..."
+        if len(stor_context_after) > max_text_len:
+            stor_context_after = stor_context_after[:max_text_len] + "..."
         print(f"\nCurrent context after: {repr(curr_context_after)}")
         print(f"Stored context after:  {repr(stor_context_after)}")
     except Exception as e:
