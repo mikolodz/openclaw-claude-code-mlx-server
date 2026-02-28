@@ -12,6 +12,7 @@ import hashlib
 import sys
 import shutil
 import signal
+import math
 from datetime import datetime
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -528,16 +529,12 @@ class LRUPromptCache:
     def __init__(self, max_size=10, ttl_seconds=1800):
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
-        # Force block size to a minimum of 16, overriding the disabled config
         self.block_size = max(16, getattr(SETTINGS, "prompt_cache_block_size", 16))
         
-        # 1. The Core Flat Cache: (model, exact_tokens) -> CacheEntry
+        # Core Flat Cache: (model, exact_tokens) -> CacheEntry
         self._entries: Dict[Tuple[str, Tuple[int, ...]], self.CacheEntry] = {}
-        
-        # 2. The Block Hash Index: (model, chain_hash) -> Set of token sequences containing this block
+        # Block Hash Index: (model, chain_hash) -> Set of token sequences
         self._block_index: Dict[Tuple[str, bytes], set] = {}
-        
-        self._lru = deque()
 
     def _is_expired(self, entry):
         if self.ttl_seconds <= 0:
@@ -565,27 +562,57 @@ class LRUPromptCache:
                     del self._block_index[idx_key]
                     
         del self._entries[key]
-        try:
-            self._lru.remove(key)
-        except ValueError:
-            pass
 
     def _extract(self, model, tokens):
         key = (model, tuple(tokens))
         entry = self._entries[key]
         entry.touched_at = time.time()
+        entry.count += 1  # Track hit frequency for eviction weighting
         
-        # Never delete the cache on read. Multi-agent branching requires 
-        # the root prefix to remain alive in VRAM for other agents to share.
-        # The LRU pruner will safely handle VRAM limits.
+        return self.CacheEntry(copy.deepcopy(entry.prompt_cache), entry.tokens, entry.count, entry.touched_at)
+
+    def _evict_optimal(self):
+        """
+        Cost-Aware Eviction: Finds the entry with the highest eviction score.
+        Protects long 'trunks' and frequently used templates; penalizes old, short branches.
+        """
+        now = time.time()
+        best_key = None
+        max_score = -1.0
+
+        for key, entry in self._entries.items():
+            age_seconds = max(1.0, now - entry.touched_at)
+            
+            # Use square root to create a balanced gravity for long chains.
+            # A 10,000 token chain has 10x more protection than a 100 token chain.
+            length_weight = math.sqrt(len(entry.tokens))
+            freq_weight = math.log1p(entry.count) + 1.0 
+            
+            # Higher score = more likely to be evicted. (Old and Short -> High Score)
+            score = age_seconds / (length_weight * freq_weight)
+            
+            if score > max_score:
+                max_score = score
+                best_key = key
+
+        if best_key:
+            self._delete(best_key[0], best_key[1])
+
+    def _cull_redundant_prefixes(self, model, new_tokens):
+        """
+        Frees up slots by removing strict prefixes. Since the cache can trim 
+        longer chains to serve shorter ones, shorter strict prefixes are wasted slots.
+        """
+        new_len = len(new_tokens)
+        to_delete = []
+        for (m, t_tup) in self._entries.keys():
+            if m == model and len(t_tup) < new_len:
+                # If the existing shorter cache is a strict prefix of the new one
+                if new_tokens[:len(t_tup)] == t_tup:
+                    to_delete.append((m, t_tup))
         
-        try:
-            self._lru.remove(key)
-        except ValueError:
-            pass
-        self._lru.append(key)
-        
-        return self.CacheEntry(copy.deepcopy(entry.prompt_cache), entry.tokens, entry.count, time.time())
+        for k in to_delete:
+            self._delete(k[0], k[1])
 
     def fetch_nearest_cache(self, model, tokens):
         self.prune_expired()
@@ -663,22 +690,25 @@ class LRUPromptCache:
             return entry.prompt_cache, [], best_cached_tokens, "longer", len(tokens_tup)
         return None, tokens, tokens, "miss", 0
 
+
     def insert_cache(self, model, tokens, prompt_cache):
         self.prune_expired()
         tokens_tup = tuple(tokens)
         key = (model, tokens_tup)
+        now = time.time()
         
         if key in self._entries:
             self._entries[key].count += 1
-            self._entries[key].touched_at = time.time()
-            self._lru.remove(key)
-            self._lru.append(key)
+            self._entries[key].touched_at = now
             return
 
-        # Insert into flat dictionary
-        self._entries[key] = self.CacheEntry(prompt_cache, tokens_tup, 1, time.time())
+        # 1. Subsumption: Cull redundant prefixes to organically free up space
+        self._cull_redundant_prefixes(model, tokens_tup)
+
+        # 2. Insert into flat dictionary
+        self._entries[key] = self.CacheEntry(prompt_cache, tokens_tup, 1, now)
         
-        # Map every block hash to this token sequence
+        # 3. Map block hashes
         chain_pairs = _block_chain_hashes(tokens_tup, self.block_size)
         for chain_hash, _ in chain_pairs:
             idx_key = (model, chain_hash)
@@ -686,11 +716,9 @@ class LRUPromptCache:
                 self._block_index[idx_key] = set()
             self._block_index[idx_key].add(tokens_tup)
 
-        self._lru.append(key)
-        
-        if len(self._lru) > self.max_size:
-            old_key = self._lru.popleft()
-            self._delete(old_key[0], old_key[1])
+        # 4. Enforce max size using the Cost-Aware Eviction
+        while len(self._entries) > self.max_size:
+            self._evict_optimal()
 
     def contains_tokens(self, model, tokens):
         key = (model, tuple(tokens))
@@ -705,7 +733,6 @@ PROMPT_CACHE = LRUPromptCache(
     max_size=SETTINGS.prompt_cache_max_entries_global,
     ttl_seconds=SETTINGS.prompt_cache_ttl_seconds,
 )
-
 
 @dataclass(frozen=True)
 class SessionContext:
