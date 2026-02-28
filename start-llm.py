@@ -371,35 +371,77 @@ def _strip_thinking_from_content(text: str) -> str:
     return out.strip()
 
 
-# Session store of full assistant content (with <think>) for VLM cache-key stability.
-# Key (model_path, session_id) -> last full assistant text. Client sends stripped content;
-# we substitute stored full content when building the next prompt so cache keys match.
-SESSION_FULL_ASSISTANT: OrderedDict = OrderedDict()
-SESSION_FULL_ASSISTANT_LOCK = threading.Lock()
-MAX_SESSION_FULL_ASSISTANT = 500
+# --- STATELESS MESSAGE HEALING STORE ---
+HEALING_STORE: OrderedDict = OrderedDict()
+HEALING_STORE_LOCK = threading.Lock()
+MAX_HEALING_STORE = 2000  # Generous size to survive deep multi-agent sessions
 
-# Token trajectory store: exact token IDs per assistant turn for cache-key stitching.
-# Key (model_path, stable_session_key) -> list of token ID lists, one per assistant turn.
-# When building the next request we stitch tokenize(prefix) + stored_turn_ids + tokenize(suffix)
-# so the token sequence matches the stored KV cache (no re-tokenization divergence).
-TOKEN_TRAJECTORY_STORE: OrderedDict = OrderedDict()
-TOKEN_TRAJECTORY_STORE_LOCK = threading.Lock()
-MAX_TRAJECTORY_TURNS_PER_CONVERSATION = 64
-MAX_TRAJECTORY_CONVERSATIONS = 500
+def _get_healing_hash(text: str, tool_calls: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    """
+    Creates a robust SHA-256 hash of the assistant's output.
+    If the text is empty but has tool calls, we hash the canonicalized tool calls.
+    """
+    base = (text or "").strip()
+    if tool_calls:
+        try:
+            # Sort keys to ensure deterministic hashing of tool calls
+            base += json.dumps(tool_calls, sort_keys=True)
+        except Exception:
+            pass
 
+    if not base:
+        return None
 
-def _token_trajectory_append(key: Tuple[str, str], generated_tokens: List[int]) -> None:
-    """Append one assistant turn's token IDs to the trajectory store; evict if over cap."""
-    with TOKEN_TRAJECTORY_STORE_LOCK:
-        turns = TOKEN_TRAJECTORY_STORE.get(key, [])
-        turns = list(turns) if isinstance(turns, list) else []
-        turns.append(list(generated_tokens))
-        if len(turns) > MAX_TRAJECTORY_TURNS_PER_CONVERSATION:
-            turns = turns[-MAX_TRAJECTORY_TURNS_PER_CONVERSATION:]
-        TOKEN_TRAJECTORY_STORE[key] = turns
-        TOKEN_TRAJECTORY_STORE.move_to_end(key, last=True)
-        while len(TOKEN_TRAJECTORY_STORE) > MAX_TRAJECTORY_CONVERSATIONS:
-            TOKEN_TRAJECTORY_STORE.popitem(last=False)
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+def _heal_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Intercepts incoming messages. If a stripped assistant message matches
+    a hash in our store, we swap it back to the full version (with <think>).
+    """
+    healed = []
+    for msg in messages:
+        m = dict(msg)
+        if (m.get("role") or "").strip().lower() == "assistant":
+            content = m.get("content", "")
+            tool_calls = m.get("tool_calls")
+
+            # Handle standard text content
+            if isinstance(content, str):
+                h = _get_healing_hash(content, tool_calls)
+                if h:
+                    with HEALING_STORE_LOCK:
+                        if h in HEALING_STORE:
+                            m["content"] = HEALING_STORE[h]
+                            # CRITICAL: Prevent the Jinja template from double-rendering 
+                            # the tool calls, since the raw text already contains them.
+                            m.pop("tool_calls", None)
+                            HEALING_STORE.move_to_end(h, last=True)
+
+            # Handle VLM list content (e.g., [{"type": "text", "text": "..."}])
+            elif isinstance(content, list):
+                new_content = []
+                healed_any = False
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_part = part.get("text") or part.get("content") or ""
+                        h = _get_healing_hash(text_part, tool_calls)
+                        if h:
+                            with HEALING_STORE_LOCK:
+                                if h in HEALING_STORE:
+                                    new_content.append({**part, "text": HEALING_STORE[h]})
+                                    healed_any = True
+                                    HEALING_STORE.move_to_end(h, last=True)
+                                    continue
+                    new_content.append(part)
+                m["content"] = new_content
+                if healed_any:
+                    # CRITICAL: Prevent double-rendering for VLM multi-part messages too
+                    m.pop("tool_calls", None)
+
+        healed.append(m)
+    return healed
+# ---------------------------------------
 
 
 def _terminal_status(icon: str, message: str, indent: int = 0) -> None:
@@ -417,13 +459,6 @@ def _debug_token_divergence(tokenizer, current_tokens: List[int], stored_tokens:
         if current_tokens[i] != stored_tokens[i]:
             diverge_idx = i
             break
-            
-    if diverge_idx == -1:
-        if len(current_tokens) == len(stored_tokens):
-            _terminal_status("🔍", "DEBUG: Token sequences are completely identical!")
-        else:
-            _terminal_status("🔍", f"DEBUG: Perfect prefix match! Lengths: {len(current_tokens)} vs {len(stored_tokens)}")
-        return
 
     # Calculate window bounds for context
     start_idx = max(0, diverge_idx - context_window)
@@ -879,157 +914,6 @@ def _flatten_content(content):
     return content
 
 
-def _vlm_stable_session_key(messages: List[Dict[str, Any]]) -> str:
-    """
-    Derive a stable session key from the first two messages (system + first user)
-    so that SESSION_FULL_ASSISTANT lookup/store matches across turns. Used when
-    session_id is implicit (derived from prompt_tokens), because for VLM we don't
-    have prompt_tokens yet when we need to look up the stored full assistant.
-    """
-    parts = []
-    for msg in messages[:2]:
-        role = (msg.get("role") or "").strip()
-        content = _flatten_content(msg.get("content", ""))
-        parts.append(f"{role}:{content}")
-    raw = "\n".join(parts)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-
-
-def _vlm_assistant_block_wrapper(
-    processor_any: Any,
-    enable_thinking: bool,
-    model_family: Optional[str] = None,
-) -> Tuple[str, str]:
-    """
-    Return (prefix, suffix) strings that wrap assistant content in the chat template.
-    Used for token trajectory stitching: we tokenize prefix + stored_turn_ids + suffix
-    so we never re-tokenize assistant content. Template-aware for Qwen; generic fallback.
-    """
-    family = (model_family or getattr(SETTINGS, "model_family", "") or "").strip().lower()
-    if family == "qwen3" or "qwen" in family:
-        # Qwen: <|im_start|>assistant\n then optional <think>\n then content then \n</think>\n<|im_end|>
-        prefix = "<|im_start|>assistant\n"
-        if enable_thinking:
-            prefix += "<think>\n"
-        suffix = "\n</think>\n<|im_end|>\n" if enable_thinking else "\n<|im_end|>\n"
-        return prefix, suffix
-    if family == "glm4":
-        # GLM4 VLM: similar structure; use generic if needed.
-        prefix = "<|assistant|>\n"
-        suffix = "\n"
-        return prefix, suffix
-    # Generic: minimal wrapper so tokenizer does not merge across boundaries.
-    prefix = "<|im_start|>assistant\n"
-    suffix = "\n<|im_end|>\n"
-    return prefix, suffix
-
-
-def _vlm_build_stitched_prompt_tokens(
-    processor_any: Any,
-    messages: List[Dict[str, Any]],
-    trajectory_turns: List[List[int]],
-    tools: Optional[Any],
-    enable_thinking: Optional[bool],
-    model_family: Optional[str] = None,
-) -> List[int]:
-    """
-    Build prompt token list by stitching tokenized segments with exact stored assistant
-    token IDs from TokenTrajectoryStore. Guarantees the token sequence matches the
-    stored KV cache from previous turns (no re-tokenization divergence).
-    """
-    template_processor = None
-    if processor_any is not None and hasattr(processor_any, "apply_chat_template"):
-        if getattr(processor_any, "chat_template", None) is not None:
-            template_processor = processor_any
-    if template_processor is None and getattr(processor_any, "tokenizer", None) is not None:
-        tok = processor_any.tokenizer
-        if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None) is not None:
-            template_processor = tok
-    if template_processor is None or not messages:
-        return []
-
-    tokenizer = getattr(processor_any, "tokenizer", processor_any)
-    template_kwargs: Dict[str, Any] = {}
-    if tools is not None:
-        template_kwargs["tools"] = tools
-    if enable_thinking is not None:
-        template_kwargs["enable_thinking"] = enable_thinking
-
-    def _apply(mes: List[Dict[str, Any]], gen: bool) -> str:
-        try:
-            raw = template_processor.apply_chat_template(
-                mes,
-                tokenize=False,
-                add_generation_prompt=gen,
-                **template_kwargs,
-            )
-        except Exception:
-            return ""
-        if isinstance(raw, list):
-            raw = raw[0] if raw else ""
-        return str(raw) if raw else ""
-
-    # Per-message segment strings (same logic as _vlm_format_prompt_prefix_stable).
-    parts: List[str] = []
-    try:
-        prev = _apply([], False)
-    except Exception:
-        prev = ""
-    for i in range(len(messages)):
-        s = _apply(messages[: i + 1], False)
-        if len(s) >= len(prev):
-            parts.append(s[len(prev) :])
-        else:
-            parts.append("")
-        prev = s
-    full_no_gen = prev
-    full_with_gen = _apply(messages, True)
-    if full_with_gen.startswith(full_no_gen) and len(full_with_gen) >= len(full_no_gen):
-        gen_suffix = full_with_gen[len(full_no_gen) :]
-    else:
-        gen_suffix = "\nAssistant:"
-
-    asst_prefix, asst_suffix = _vlm_assistant_block_wrapper(
-        processor_any, bool(enable_thinking), model_family
-    )
-
-    def _tokenize_segment(seg: str, add_special_tokens: bool) -> List[int]:
-        if not seg:
-            return []
-        seg = _vlm_normalize_thinking_newlines(seg)
-        if tokenizer.bos_token is None or not add_special_tokens:
-            return tokenizer.encode(seg, add_special_tokens=add_special_tokens)
-        return tokenizer.encode(seg, add_special_tokens=add_special_tokens)
-
-    out: List[int] = []
-    assistant_count = sum(1 for msg in messages if (msg.get("role") or "").strip().lower() == "assistant")
-    use_count = min(len(trajectory_turns), assistant_count)
-    trajectory_start_idx = assistant_count - use_count
-
-    assistant_idx = 0
-    first = True
-    for i, msg in enumerate(messages):
-        seg = parts[i] if i < len(parts) else ""
-        role = (msg.get("role") or "").strip().lower()
-        if role == "assistant":
-            if assistant_idx < trajectory_start_idx:
-                # Fallback: tokenize segment as-is (no stored trajectory).
-                out.extend(_tokenize_segment(seg, add_special_tokens=first))
-                first = False
-            else:
-                out.extend(_tokenize_segment(asst_prefix, add_special_tokens=first))
-                first = False
-                turn_idx = assistant_idx - trajectory_start_idx
-                out.extend(trajectory_turns[turn_idx])
-                out.extend(_tokenize_segment(asst_suffix, add_special_tokens=False))
-            assistant_idx += 1
-        else:
-            out.extend(_tokenize_segment(seg, add_special_tokens=first))
-            first = False
-    out.extend(_tokenize_segment(gen_suffix, add_special_tokens=False))
-    return out
-
-
 def _prepare_messages_for_template(messages):
     normalized = []
     for msg in messages:
@@ -1186,95 +1070,6 @@ def _prepare_messages_for_vlm(messages: List[Dict[str, Any]], tools: Optional[An
         normalized.append(m)
     return normalized
 
-
-def _vlm_normalize_thinking_newlines(formatted: str) -> str:
-    """
-    Best-effort canonicalize newlines after <think> and </think> for tokenization stability.
-    The canonical fix for cache-key divergence is Token Trajectory Stitching (stored
-    exact token IDs per assistant turn); this normalization is fallback when trajectory
-    is not used (e.g. first turn or eviction).
-    """
-    if not formatted:
-        return formatted
-    # After opening <think> or closing </think>, collapse any run of whitespace+newlines to single \\n
-    formatted = re.sub(r"(<think>)\s*\n+", r"\1\n", formatted)
-    formatted = re.sub(r"(</think>)\s*\n+", r"\1\n", formatted)
-    return formatted
-
-
-def _vlm_format_prompt_prefix_stable(
-    processor_any,
-    messages: List[Dict[str, Any]],
-    add_generation_prompt: bool = True,
-    **kwargs: Any,
-) -> str:
-    """
-    Build the chat-formatted prompt so that the prefix for the first K messages
-    is always the same token sequence regardless of how many messages follow.
-    This enables prompt-cache prefix reuse across turns (cache=shorter).
-    Falls back to get_chat_template if the processor has no apply_chat_template.
-    Pass tools= and enable_thinking= (and any other template kwargs) so output
-    matches the full template and cache prefixes align.
-    """
-    try:
-        _vlm_diagnostics.used_prefix_stable = False
-    except AttributeError:
-        pass
-    template_processor = None
-    if processor_any is not None and hasattr(processor_any, "apply_chat_template"):
-        if getattr(processor_any, "chat_template", None) is not None:
-            template_processor = processor_any
-    if template_processor is None and getattr(processor_any, "tokenizer", None) is not None:
-        tok = processor_any.tokenizer
-        if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None) is not None:
-            template_processor = tok
-    if template_processor is None or not messages:
-        out = get_chat_template(
-            processor_any,
-            messages,
-            add_generation_prompt=add_generation_prompt,
-            tokenize=False,
-            **kwargs,
-        )
-        if isinstance(out, list):
-            out = out[0].get("content", "") if out else ""
-        return _vlm_normalize_thinking_newlines(str(out) if out else "")
-
-    _vlm_diagnostics.used_prefix_stable = True
-
-    def _apply(mes: List[Dict[str, Any]], gen: bool) -> str:
-        try:
-            raw = template_processor.apply_chat_template(
-                mes,
-                tokenize=False,
-                add_generation_prompt=gen,
-                **kwargs,
-            )
-        except Exception:
-            return ""
-        if isinstance(raw, list):
-            raw = raw[0] if raw else ""
-        return str(raw) if raw else ""
-
-    parts = []
-    try:
-        prev = _apply([], False)
-    except Exception:
-        prev = ""
-    for i in range(len(messages)):
-        s = _apply(messages[: i + 1], False)
-        if len(s) >= len(prev):
-            parts.append(s[len(prev) :])
-        prev = s
-    full_no_gen = prev
-    full_with_gen = _apply(messages, True)
-    if full_with_gen.startswith(full_no_gen) and len(full_with_gen) >= len(full_no_gen):
-        gen_suffix = full_with_gen[len(full_no_gen) :]
-    else:
-        gen_suffix = "\nAssistant:" if add_generation_prompt else ""
-    return _vlm_normalize_thinking_newlines("".join(parts) + gen_suffix)
-
-
 def _vlm_prompt_and_inputs(
     processor_any,
     config: Dict[str, Any],
@@ -1285,19 +1080,52 @@ def _vlm_prompt_and_inputs(
     **kwargs: Any,
 ) -> Tuple[Any, Any, Any]:
     """
-    Build formatted prompt and run prepare_inputs for VLM.
+    Build formatted prompt and run prepare_inputs for VLM using native chat templates.
     Returns (input_ids, pixel_values, mask) where input_ids is mx.array; mask may be None.
-    Uses prefix-stable formatting so cache prefix reuse works across turns.
-    Pass tools= and enable_thinking= so the template output matches and cache aligns.
     """
     template_kwargs = dict(kwargs)
     if tools is not None:
         template_kwargs["tools"] = tools
     if enable_thinking is not None:
         template_kwargs["enable_thinking"] = enable_thinking
-    formatted = _vlm_format_prompt_prefix_stable(
-        processor_any, messages, add_generation_prompt=True, **template_kwargs
-    )
+
+    template_processor = None
+    if processor_any is not None and hasattr(processor_any, "apply_chat_template"):
+        if getattr(processor_any, "chat_template", None) is not None:
+            template_processor = processor_any
+    if template_processor is None and getattr(processor_any, "tokenizer", None) is not None:
+        tok = processor_any.tokenizer
+        if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None) is not None:
+            template_processor = tok
+
+    formatted = ""
+    if template_processor is not None:
+        try:
+            formatted = template_processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **template_kwargs,
+            )
+            if isinstance(formatted, list):
+                formatted = formatted[0] if formatted else ""
+            formatted = str(formatted)
+        except Exception:
+            formatted = ""
+            
+    # Fallback to mlx_vlm's get_chat_template if HF template fails/is missing
+    if not formatted:
+        out = get_chat_template(
+            processor_any,
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            **template_kwargs,
+        )
+        if isinstance(out, list):
+            out = out[0].get("content", "") if out else ""
+        formatted = str(out) if out else ""
+
     inputs = vlm_prepare_inputs(
         processor_any,
         images=images if images else None,
@@ -1305,13 +1133,12 @@ def _vlm_prompt_and_inputs(
         add_special_tokens=True,
         return_tensors="mlx",
     )
+    
     input_ids = inputs.get("input_ids")
     pixel_values = inputs.get("pixel_values")
     mask = inputs.get("attention_mask")
-    if input_ids is not None and hasattr(input_ids, "tolist"):
-        input_ids = input_ids  # keep mx.array for now; convert to list where needed
+    
     return input_ids, pixel_values, mask
-
 
 def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
     """
@@ -1971,13 +1798,11 @@ else:
 _terminal_status(
     "🧠",
     (
-        "Cache config loaded | "
-        f"global_entries={SETTINGS.prompt_cache_max_entries_global} | "
-        f"per_session_entries={SETTINGS.prompt_cache_max_entries_per_session} | "
+        "Global Cache Config loaded | "
+        f"max_entries={SETTINGS.prompt_cache_max_entries_global} | "
         f"ttl_seconds={SETTINGS.prompt_cache_ttl_seconds} | "
-        f"session_idle_seconds={SETTINGS.prompt_cache_session_max_idle_seconds} | "
-        "session_partitioning=False (global only) | "
-        f"canonicalize_tool_context={SETTINGS.cache_canonicalize_tool_context}"
+        f"canonicalize_tool_context={SETTINGS.cache_canonicalize_tool_context} | "
+        f"healing_store_capacity={MAX_HEALING_STORE}"
     ),
 )
 
@@ -2090,31 +1915,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if is_vlm:
             raw_messages = body.get("messages", [])
-            session_ctx_early = _extract_session_context(body, [])
-            stable_key = _vlm_stable_session_key(raw_messages) if raw_messages else None
-            key = (SETTINGS.model_path, stable_key) if stable_key else None
-            if (
-                enable_thinking
-                and len(raw_messages) > 0
-                and raw_messages[-1].get("role") == "assistant"
-            ):
-                # Use stable key from first two messages so lookup matches store across
-                # turns; implicit session_id is derived from prompt_tokens which we
-                # don't have yet for VLM.
-                with SESSION_FULL_ASSISTANT_LOCK:
-                    stored = SESSION_FULL_ASSISTANT.get(key)
-                # Use stored full assistant content when we have it so the tokenized prompt
-                # matches the previous turn's cache (client may send stripped/different wording).
-                use_stored = bool(stored)
-                if use_stored:
-                    messages_for_vlm = [dict(m) for m in raw_messages]
-                    messages_for_vlm[-1]["content"] = stored
-                    messages = _prepare_messages_for_vlm(messages_for_vlm, tools=tools)
-                else:
-                    messages = _prepare_messages_for_vlm(raw_messages, tools=tools)
-            else:
-                messages = _prepare_messages_for_vlm(raw_messages, tools=tools)
+            # --- APPLY STATELESS HEALING ---
+            healed_messages = _heal_messages(raw_messages)
+
+            messages = _prepare_messages_for_vlm(healed_messages, tools=tools)
             images = _extract_images_from_messages(body.get("messages", []))
+
             with model_lock:
                 vlm_input_ids_raw, vlm_pixel_values, vlm_mask = _vlm_prompt_and_inputs(
                     processor,
@@ -2125,6 +1931,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     enable_thinking=enable_thinking,
                 )
                 _vlm_sync_before_generation(vlm_pixel_values, vlm_mask)
+
             if vlm_input_ids_raw is not None:
                 if hasattr(vlm_input_ids_raw, "flatten"):
                     prompt_tokens = vlm_input_ids_raw.flatten().tolist()
@@ -2132,81 +1939,29 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt_tokens = list(vlm_input_ids_raw)
             else:
                 prompt_tokens = []
-            # Token trajectory stitching: when we have stored token IDs for every assistant
-            # turn, build prompt_tokens by stitching so the sequence matches the KV cache.
-            assistant_count = sum(
-                1 for m in messages if (m.get("role") or "").strip().lower() == "assistant"
-            )
-            if (
-                enable_thinking
-                and assistant_count > 0
-                and stable_key is not None
-            ):
-                with TOKEN_TRAJECTORY_STORE_LOCK:
-                    trajectory_list = list(TOKEN_TRAJECTORY_STORE.get(key, []))
-                if trajectory_list:
-                    use_count = min(len(trajectory_list), assistant_count)
-                    trajectory_turns = trajectory_list[-use_count:]
-                    stitched = _vlm_build_stitched_prompt_tokens(
-                        processor,
-                        messages,
-                        trajectory_turns,
-                        tools=tools,
-                        enable_thinking=enable_thinking,
-                        model_family=SETTINGS.model_family,
-                    )
-                    if stitched:
-                        prompt_tokens = stitched
-            # VLM cache key = this token list. We use _vlm_format_prompt_prefix_stable so
-            # the prefix for the first K messages tokenizes identically across turns (cache=shorter).
+
             prompt = ""
+
         else:
-            messages = _prepare_messages_for_template(body.get("messages", []))
-            # Token trajectory stitching (LM path): stitch stored assistant token IDs when available
-            prompt_tokens = None
-            raw_messages_lm = body.get("messages", [])
-            stable_key_lm = _vlm_stable_session_key(raw_messages_lm) if raw_messages_lm else None
-            key_lm = (SETTINGS.model_path, stable_key_lm) if stable_key_lm else None
-            assistant_count_lm = sum(
-                1 for m in messages if (m.get("role") or "").strip().lower() == "assistant"
-            )
-            if (
-                enable_thinking
-                and assistant_count_lm > 0
-                and key_lm is not None
-            ):
-                with TOKEN_TRAJECTORY_STORE_LOCK:
-                    trajectory_list_lm = list(TOKEN_TRAJECTORY_STORE.get(key_lm, []))
-                if trajectory_list_lm:
-                    use_count_lm = min(len(trajectory_list_lm), assistant_count_lm)
-                    trajectory_turns_lm = trajectory_list_lm[-use_count_lm:]
-                    stitched_lm = _vlm_build_stitched_prompt_tokens(
-                        tokenizer,
-                        messages,
-                        trajectory_turns_lm,
-                        tools=tools,
-                        enable_thinking=enable_thinking,
-                        model_family=SETTINGS.model_family,
-                    )
-                    if stitched_lm:
-                        prompt_tokens = stitched_lm
-            if prompt_tokens is None:
-                if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-                    prompt = tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        tools=tools,
-                        enable_thinking=enable_thinking,
-                    )
-                else:
-                    prompt = messages[-1]["content"] if messages else ""
-                cache_prompt = _normalize_prompt_for_cache(prompt)
-                prompt_tokens = _tokenize_prompt(cache_prompt)
-                prompt_was_normalized = cache_prompt != prompt
+            raw_messages = body.get("messages", [])
+            # --- APPLY STATELESS HEALING ---
+            healed_messages = _heal_messages(raw_messages)
+            messages = _prepare_messages_for_template(healed_messages)
+
+            if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    enable_thinking=enable_thinking,
+                )
             else:
-                prompt = ""
-                prompt_was_normalized = False
+                prompt = messages[-1]["content"] if messages else ""
+
+            cache_prompt = _normalize_prompt_for_cache(prompt)
+            prompt_tokens = _tokenize_prompt(cache_prompt)
+            prompt_was_normalized = cache_prompt != prompt
 
         session_ctx = _extract_session_context(body, prompt_tokens)
         if is_vlm:
@@ -2223,15 +1978,6 @@ class APIHandler(BaseHTTPRequestHandler):
         sampler, sampler_kwargs = _build_sampler(body)
         max_tokens = body.get("max_tokens", SETTINGS.default_max_tokens)
         is_streaming = body.get("stream", False)
-
-        # --- INJECT DEBUG BLOCK HERE ---
-        if SETTINGS.vlm_cache_debug and session_ctx.session_id:
-            state = SESSION_INDEX._sessions.get(session_ctx.session_id)
-            if state and state.keys:
-                # Grab the most recent cache key for this session
-                most_recent_stored_key = state.keys[-1]
-                _debug_token_divergence(tokenizer, prompt_tokens, most_recent_stored_key, context_window=8)
-        # --- END INJECT DEBUG BLOCK ---
 
         acquired = False
         generated_tokens = []
@@ -2259,6 +2005,13 @@ class APIHandler(BaseHTTPRequestHandler):
                     session_ctx=session_ctx,
                     prompt_cache_store=PROMPT_CACHE,
                 )
+
+            # --- DEBUG BLOCK ---
+            if SETTINGS.vlm_cache_debug and cache_session_tokens and cache_match_type in ("shorter", "miss"):
+                # Compare the prompt against the actual candidate the global cache evaluated
+                _debug_token_divergence(tokenizer, prompt_tokens, cache_session_tokens, context_window=8)
+            # -----------------------
+
             if prompt_cache is None:
                 cache_model = model.language_model if is_vlm and hasattr(model, "language_model") else model
                 prompt_cache = make_prompt_cache(cache_model, max_kv_size=SETTINGS.max_kv_size)
@@ -2321,19 +2074,26 @@ class APIHandler(BaseHTTPRequestHandler):
                     sampler_payload["prompt_token_prefix"] = list(prompt_tokens[:64])
                 request_logger.log("sampler", sampler_payload, request_id=request_id)
 
+            prompt_len = len(prompt_tokens)
+            hit_ratio = (matched_prefix_len / prompt_len * 100) if prompt_len > 0 else 0.0
+            
+            if hit_ratio >= 85:
+                cache_light = "🟢"
+            elif hit_ratio >= 50:
+                cache_light = "🟡"
+            else:
+                cache_light = "🔴"
+
             _terminal_status(
                 "📨",
-                f"Request {request_id} received | stream={body.get('stream', False)} | "
-                f"prompt_tokens={len(prompt_tokens)} | cache={cache_match_type} | "
-                f"prefix_tokens={matched_prefix_len} | rest_tokens={rest_count} | "
-                f"normalized={prompt_was_normalized} | "
-                f"thinking={enable_thinking} ({reasoning_control['source']}) | "
-                f"family={SETTINGS.model_family} | session={session_ctx.session_id} ({cache_selection_source})",
+                f"Request {request_id} | {cache_light} Cache: {hit_ratio:.1f}% ({cache_match_type}) | "
+                f"tokens={matched_prefix_len}/{prompt_len} | rest={rest_count} | "
+                f"stream={body.get('stream', False)} | thinking={enable_thinking}",
             )
             _terminal_status(
                 "⚙️",
-                f"Request {request_id} generation started | wait={wait_seconds:.2f}s | "
-                f"cache={cache_match_type} | prefix_tokens={matched_prefix_len} | prefill_tokens={rest_count}",
+                f"Generation started | wait={wait_seconds:.2f}s | prefill={rest_count} | "
+                f"session={session_ctx.session_id[:16]} ({cache_selection_source}) | family={SETTINGS.model_family}",
                 indent=1,
             )
 
@@ -2367,19 +2127,20 @@ class APIHandler(BaseHTTPRequestHandler):
                 message_text, tool_calls = _extract_openai_tool_calls(
                     response_text, SETTINGS.model_family
                 )
-                # Hide <think> blocks from the client whenever reasoning was requested (LM or VLM).
+                # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
-                if enable_thinking:
-                    traj_key = (SETTINGS.model_path, _vlm_stable_session_key(body.get("messages", [])))
-                    _token_trajectory_append(traj_key, generated_tokens)
-                if is_vlm and enable_thinking:
-                    with SESSION_FULL_ASSISTANT_LOCK:
-                        traj_key = (SETTINGS.model_path, _vlm_stable_session_key(body.get("messages", [])))
-                        SESSION_FULL_ASSISTANT[traj_key] = raw_response_text
-                        SESSION_FULL_ASSISTANT.move_to_end(traj_key, last=True)
-                        while len(SESSION_FULL_ASSISTANT) > MAX_SESSION_FULL_ASSISTANT:
-                            SESSION_FULL_ASSISTANT.popitem(last=False)
+
+                    # --- NEW HEALING STORE LOGIC ---
+                    if raw_response_text != message_text:
+                        h = _get_healing_hash(message_text, tool_calls)
+                        if h:
+                            with HEALING_STORE_LOCK:
+                                HEALING_STORE[h] = raw_response_text
+                                HEALING_STORE.move_to_end(h, last=True)
+                                while len(HEALING_STORE) > MAX_HEALING_STORE:
+                                    HEALING_STORE.popitem(last=False)
+
                 finish_reason = "tool_calls" if tool_calls else "stop"
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
@@ -2482,19 +2243,20 @@ class APIHandler(BaseHTTPRequestHandler):
                 message_text, tool_calls = _extract_openai_tool_calls(
                     full_text, SETTINGS.model_family
                 )
-                # Hide <think> blocks from the client whenever reasoning was requested (LM or VLM).
+                # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
-                if enable_thinking:
-                    traj_key_stream = (SETTINGS.model_path, _vlm_stable_session_key(body.get("messages", [])))
-                    _token_trajectory_append(traj_key_stream, generated_tokens)
-                if is_vlm and enable_thinking:
-                    with SESSION_FULL_ASSISTANT_LOCK:
-                        traj_key_stream = (SETTINGS.model_path, _vlm_stable_session_key(body.get("messages", [])))
-                        SESSION_FULL_ASSISTANT[traj_key_stream] = raw_full_text
-                        SESSION_FULL_ASSISTANT.move_to_end(traj_key_stream, last=True)
-                        while len(SESSION_FULL_ASSISTANT) > MAX_SESSION_FULL_ASSISTANT:
-                            SESSION_FULL_ASSISTANT.popitem(last=False)
+
+                    # --- NEW HEALING STORE LOGIC ---
+                    if raw_full_text != message_text:
+                        h = _get_healing_hash(message_text, tool_calls)
+                        if h:
+                            with HEALING_STORE_LOCK:
+                                HEALING_STORE[h] = raw_full_text
+                                HEALING_STORE.move_to_end(h, last=True)
+                                while len(HEALING_STORE) > MAX_HEALING_STORE:
+                                    HEALING_STORE.popitem(last=False)
+
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
                     _insert_cache_entries(
