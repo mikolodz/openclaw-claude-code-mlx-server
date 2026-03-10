@@ -359,6 +359,11 @@ CACHE_CCH_PATTERN = re.compile(r"cch=[a-zA-Z0-9]+;?", re.IGNORECASE)
 CACHE_BILLING_HEADER_PATTERN = re.compile(
     r"-anthropic-billing-header:\s*[a-zA-Z0-9\-]+", re.IGNORECASE
 )
+# Claude Code injects variable <system-reminder> text (e.g. "gentle reminder" vs "improve or augment");
+# normalize so stream=true vs stream=false retries hit cache.
+CACHE_SYSTEM_REMINDER_PATTERN = re.compile(
+    r"<system-reminder>.*?</system-reminder>", re.DOTALL | re.IGNORECASE
+)
 # Strip reasoning from response content when returning to client (so reasoning is hidden).
 # Full think blocks (<think>...</think>) and "orphan" </think> (reasoning with no opening tag, e.g. GLM-style).
 THINK_TAG_STRIP_PATTERN = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -617,6 +622,11 @@ class LRUPromptCache:
                 if new_tokens[:len(t_tup)] == t_tup:
                     to_delete.append((m, t_tup))
         
+        to_delete.sort(key=lambda x: len(x[1]), reverse=True)
+        if to_delete:
+            # Spare the longest prefix from deletion
+            to_delete.pop(0) 
+
         for k in to_delete:
             self._delete(k[0], k[1])
 
@@ -1170,6 +1180,10 @@ def _vlm_prompt_and_inputs(
             out = out[0].get("content", "") if out else ""
         formatted = str(out) if out else ""
 
+    # Normalize for cache so retries / stream=false use same token sequence as stream=true
+    if formatted and SETTINGS.cache_canonicalize_tool_context:
+        formatted = _normalize_prompt_for_cache(formatted)
+
     inputs = vlm_prepare_inputs(
         processor_any,
         images=images if images else None,
@@ -1513,6 +1527,9 @@ def _normalize_prompt_for_cache(prompt):
     normalized = CACHE_CCH_PATTERN.sub("cch=STATIC_CACHE;", normalized)
     normalized = CACHE_BILLING_HEADER_PATTERN.sub(
         "-anthropic-billing-header: STATIC_CACHE", normalized
+    )
+    normalized = CACHE_SYSTEM_REMINDER_PATTERN.sub(
+        "__CACHE_STABLE_SYSTEM_REMINDER__", normalized
     )
     return normalized
 
