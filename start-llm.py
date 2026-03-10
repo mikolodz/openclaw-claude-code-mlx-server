@@ -353,6 +353,12 @@ CACHE_STABLE_INBOUND_CONTEXT_BLOCK = (
 INBOUND_CONTEXT_TO_PROJECT_BOUNDARY_PATTERN = re.compile(
     r"(__CACHE_STABLE_INBOUND_CONTEXT__)\n+# Project Context"
 )
+# Cache normalization: scrub volatile request-specific text so retries hit cache.
+CACHE_TIME_PATTERN = re.compile(r"Current time is[^\n]+\.", re.IGNORECASE)
+CACHE_CCH_PATTERN = re.compile(r"cch=[a-zA-Z0-9]+;?", re.IGNORECASE)
+CACHE_BILLING_HEADER_PATTERN = re.compile(
+    r"-anthropic-billing-header:\s*[a-zA-Z0-9\-]+", re.IGNORECASE
+)
 # Strip reasoning from response content when returning to client (so reasoning is hidden).
 # Full think blocks (<think>...</think>) and "orphan" </think> (reasoning with no opening tag, e.g. GLM-style).
 THINK_TAG_STRIP_PATTERN = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -1502,6 +1508,12 @@ def _normalize_prompt_for_cache(prompt):
         normalized,
         count=1,
     )
+    # Scrub timestamp and Claude Code telemetry so retries don't break cache (e.g. at ~15k tokens).
+    normalized = CACHE_TIME_PATTERN.sub("__CACHE_STABLE_TIME__", normalized)
+    normalized = CACHE_CCH_PATTERN.sub("cch=STATIC_CACHE;", normalized)
+    normalized = CACHE_BILLING_HEADER_PATTERN.sub(
+        "-anthropic-billing-header: STATIC_CACHE", normalized
+    )
     return normalized
 
 
@@ -1678,18 +1690,22 @@ def start_litellm_proxy():
     _terminal_status("🌉", f"Launching LiteLLM Proxy on port {SETTINGS.proxy_port}...")
 
     # Use proxy config so unsupported OpenAI params (e.g. "store") are dropped.
+    # request_timeout (seconds): allow long prefills (e.g. 75k tokens) so client retries
+    # don't trigger a timeout death spiral; 20 min is generous for local MLX.
     config_yaml = f"""model_list:
   - model_name: {SETTINGS.proxy_model_id}
     litellm_params:
       model: {SETTINGS.proxy_model_id}
       api_base: http://127.0.0.1:{SETTINGS.mlx_port}/v1
       api_key: local
+      timeout: 1200
       # Keep these request fields when drop_params=true so this server can map
       # OpenClaw/Claude reasoning intent into tokenizer enable_thinking.
       allowed_openai_params:
         - reasoning_effort
 litellm_settings:
   drop_params: true
+  request_timeout: 1200
 """
     fd, temp_path = tempfile.mkstemp(prefix="litellm-qwen-", suffix=".yaml")
     with os.fdopen(fd, "w") as config_file:
