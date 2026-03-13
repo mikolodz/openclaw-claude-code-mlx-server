@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 # --- THE METAL CRASH FIX (CPU QUARANTINE) ---
 import torch
+
 # Blindfold PyTorch so it never touches the Apple Silicon GPU (MPS).
 # This forces torchvision to use the CPU, preventing Metal Command Buffer
 # collisions with MLX during massive OpenClaw prefills.
@@ -32,7 +33,11 @@ torch.backends.mps.is_built = lambda: False
 import mlx.core as mx
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
-from mlx_lm.models.cache import make_prompt_cache, can_trim_prompt_cache, trim_prompt_cache
+from mlx_lm.models.cache import (
+    make_prompt_cache,
+    can_trim_prompt_cache,
+    trim_prompt_cache,
+)
 
 # Optional VLM support (Blaizzy/mlx-vlm). If unavailable, is_vlm is always False.
 try:
@@ -43,6 +48,7 @@ try:
     from mlx_vlm.utils import prepare_inputs as vlm_prepare_inputs
     from mlx_vlm.utils import load_image as vlm_load_image
     from mlx_vlm.prompt_utils import get_chat_template
+
     mlx_vlm_available = True
 except ImportError:
     mlx_vlm_available = False
@@ -233,12 +239,16 @@ def _build_settings() -> Settings:
         default_top_k=_env_int("DEFAULT_TOP_K", 40),
         default_min_p=_env_float("DEFAULT_MIN_P", 0.05),
         default_repetition_penalty=_env_float("DEFAULT_REPETITION_PENALTY", 1.08),
-        default_repetition_context_size=_env_int("DEFAULT_REPETITION_CONTEXT_SIZE", 256),
+        default_repetition_context_size=_env_int(
+            "DEFAULT_REPETITION_CONTEXT_SIZE", 256
+        ),
         default_max_tokens=_env_int("DEFAULT_MAX_TOKENS", 2048),
         enable_request_logging=_env_bool("ENABLE_REQUEST_LOGGING", True),
         default_thinking=_env_bool("DEFAULT_THINKING", True),
         vlm_cache_debug=_env_bool("VLM_CACHE_DEBUG", False),
-        normalize_write_tool_content_for_prompt=_env_bool("NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", False),
+        normalize_write_tool_content_for_prompt=_env_bool(
+            "NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", False
+        ),
         cache_canonicalize_tool_context=_env_bool_any(
             ["CACHE_CANONICALIZE_TOOL_CONTEXT"],
             True,
@@ -261,21 +271,54 @@ def _build_settings() -> Settings:
 SETTINGS = _build_settings()
 
 # VLM model_type whitelist (from mlx-vlm prompt_utils / supported architectures).
-VLM_MODEL_TYPES = frozenset({
-    "qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe",
-    "qwen3_5", "qwen3_5_moe", "qwen3_omni_moe",
-    "glm4v", "glm4v_moe", "glm_ocr",
-    "llava", "llava_next", "llava_qwen2", "llava_bunny",
-    "idefics2", "idefics3", "mistral3",
-    "gemma3", "gemma3n", "pixtral",
-    "deepseek_vl_v2", "deepseekocr", "deepseekocr_2",
-    "aya_vision", "cohere2_vision", "internvl_chat",
-    "kimi_vl", "molmo", "molmo2", "smolvlm",
-    "jina_vlm", "jvlm", "phi3_v", "paligemma",
-    "florence2", "multi_modality", "mllama", "llama4",
-    "dots_ocr", "paddleocr_vl", "ernie4_5_moe_vl",
-    "lfm2_vl", "hunyuan_vl", "bunny-llama",
-})
+VLM_MODEL_TYPES = frozenset(
+    {
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_omni_moe",
+        "glm4v",
+        "glm4v_moe",
+        "glm_ocr",
+        "llava",
+        "llava_next",
+        "llava_qwen2",
+        "llava_bunny",
+        "idefics2",
+        "idefics3",
+        "mistral3",
+        "gemma3",
+        "gemma3n",
+        "pixtral",
+        "deepseek_vl_v2",
+        "deepseekocr",
+        "deepseekocr_2",
+        "aya_vision",
+        "cohere2_vision",
+        "internvl_chat",
+        "kimi_vl",
+        "molmo",
+        "molmo2",
+        "smolvlm",
+        "jina_vlm",
+        "jvlm",
+        "phi3_v",
+        "paligemma",
+        "florence2",
+        "multi_modality",
+        "mllama",
+        "llama4",
+        "dots_ocr",
+        "paddleocr_vl",
+        "ernie4_5_moe_vl",
+        "lfm2_vl",
+        "hunyuan_vl",
+        "bunny-llama",
+    }
+)
 
 
 def _resolve_model_path_and_config():
@@ -294,7 +337,20 @@ def _resolve_model_path_and_config():
     if mlx_vlm_available:
         try:
             from huggingface_hub import snapshot_download
-            path = Path(snapshot_download(repo_id=path_str, allow_patterns=["*.json", "*.safetensors", "*.model", "*.tiktoken", "*.py", "*.jinja"]))
+
+            path = Path(
+                snapshot_download(
+                    repo_id=path_str,
+                    allow_patterns=[
+                        "*.json",
+                        "*.safetensors",
+                        "*.model",
+                        "*.tiktoken",
+                        "*.py",
+                        "*.jinja",
+                    ],
+                )
+            )
             config_path = path / "config.json"
             if config_path.exists():
                 with open(config_path, encoding="utf-8") as f:
@@ -329,16 +385,20 @@ console_lock = threading.Lock()
 proxy_process = None
 proxy_config_path = None
 
-TOOL_CALL_PATTERN = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
+TOOL_CALL_PATTERN = re.compile(
+    r"<tool_call>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE
+)
 ARG_PAIR_PATTERN = re.compile(
     r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
     re.DOTALL | re.IGNORECASE,
 )
-QWEN_FUNCTION_PATTERN = re.compile(r"<function=([^>\s]+)>\s*(.*?)\s*</function>", re.DOTALL | re.IGNORECASE)
-QWEN_PARAMETER_PATTERN = re.compile(r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", re.DOTALL | re.IGNORECASE)
-INBOUND_META_MESSAGE_ID_PATTERN = re.compile(
-    r'("message_id"\s*:\s*")[^"]+(")'
+QWEN_FUNCTION_PATTERN = re.compile(
+    r"<function=([^>\s]+)>\s*(.*?)\s*</function>", re.DOTALL | re.IGNORECASE
 )
+QWEN_PARAMETER_PATTERN = re.compile(
+    r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", re.DOTALL | re.IGNORECASE
+)
+INBOUND_META_MESSAGE_ID_PATTERN = re.compile(r'("message_id"\s*:\s*")[^"]+(")')
 INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN = re.compile(
     r"## Group Chat Context\s*\n"
     r"## Inbound Context \(trusted metadata\)\s*\n"
@@ -366,7 +426,9 @@ CACHE_SYSTEM_REMINDER_PATTERN = re.compile(
 )
 # Strip reasoning from response content when returning to client (so reasoning is hidden).
 # Full think blocks (<think>...</think>) and "orphan" </think> (reasoning with no opening tag, e.g. GLM-style).
-THINK_TAG_STRIP_PATTERN = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+THINK_TAG_STRIP_PATTERN = re.compile(
+    r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE
+)
 # Orphan </think>: content from start up to and including </think> so we hide reasoning when model
 # outputs "reasoning text</think>\n\nanswer" without a leading <think> tag.
 THINK_ORPHAN_CLOSE_PATTERN = re.compile(r"^.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -388,7 +450,10 @@ HEALING_STORE: OrderedDict = OrderedDict()
 HEALING_STORE_LOCK = threading.Lock()
 MAX_HEALING_STORE = 2000  # Generous size to survive deep multi-agent sessions
 
-def _get_healing_hash(text: str, tool_calls: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+
+def _get_healing_hash(
+    text: str, tool_calls: Optional[List[Dict[str, Any]]] = None
+) -> Optional[str]:
     """
     Creates a robust SHA-256 hash of the assistant's output.
     If the text is empty but has tool calls, we hash the canonicalized tool calls.
@@ -405,6 +470,7 @@ def _get_healing_hash(text: str, tool_calls: Optional[List[Dict[str, Any]]] = No
         return None
 
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
 
 def _heal_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -425,7 +491,7 @@ def _heal_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     with HEALING_STORE_LOCK:
                         if h in HEALING_STORE:
                             m["content"] = HEALING_STORE[h]
-                            # CRITICAL: Prevent the Jinja template from double-rendering 
+                            # CRITICAL: Prevent the Jinja template from double-rendering
                             # the tool calls, since the raw text already contains them.
                             m.pop("tool_calls", None)
                             HEALING_STORE.move_to_end(h, last=True)
@@ -441,7 +507,9 @@ def _heal_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         if h:
                             with HEALING_STORE_LOCK:
                                 if h in HEALING_STORE:
-                                    new_content.append({**part, "text": HEALING_STORE[h]})
+                                    new_content.append(
+                                        {**part, "text": HEALING_STORE[h]}
+                                    )
                                     healed_any = True
                                     HEALING_STORE.move_to_end(h, last=True)
                                     continue
@@ -453,6 +521,8 @@ def _heal_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         healed.append(m)
     return healed
+
+
 # ---------------------------------------
 
 
@@ -462,11 +532,17 @@ def _terminal_status(icon: str, message: str, indent: int = 0) -> None:
         pad = "  " * max(indent, 0)
         print(f"{pad}{icon} [{ts}] {message}", flush=True)
 
-def _debug_token_divergence(tokenizer, current_tokens: List[int], stored_tokens: Tuple[int, ...], context_window: int = 5):
+
+def _debug_token_divergence(
+    tokenizer,
+    current_tokens: List[int],
+    stored_tokens: Tuple[int, ...],
+    context_window: int = 5,
+):
     """Finds and prints exactly where two token sequences diverge for cache debugging."""
     min_len = min(len(current_tokens), len(stored_tokens))
     diverge_idx = -1
-    
+
     for i in range(min_len):
         if current_tokens[i] != stored_tokens[i]:
             diverge_idx = i
@@ -483,7 +559,7 @@ def _debug_token_divergence(tokenizer, current_tokens: List[int], stored_tokens:
     end_idx_current = min(len(current_tokens), diverge_idx + context_window + 1)
     end_idx_stored = min(len(stored_tokens), diverge_idx + context_window + 1)
 
-    print(f"\n" + "="*50)
+    print(f"\n" + "=" * 50)
     print(f"🚨 CACHE DIVERGENCE DETECTED AT INDEX {diverge_idx} 🚨")
     print(f"Token IDs before divergence (last {len(tokens_before)}): {tokens_before}")
 
@@ -495,11 +571,19 @@ def _debug_token_divergence(tokenizer, current_tokens: List[int], stored_tokens:
 
         curr_divergent_token = current_tokens[diverge_idx]
         stor_divergent_token = stored_tokens[diverge_idx]
-        print(f"\n❌ Current Request Token [{diverge_idx}]: ID {curr_divergent_token} -> {repr(tokenizer.decode([curr_divergent_token]))}")
-        print(f"❌ Stored Cache Token  [{diverge_idx}]: ID {stor_divergent_token} -> {repr(tokenizer.decode([stor_divergent_token]))}")
+        print(
+            f"\n❌ Current Request Token [{diverge_idx}]: ID {curr_divergent_token} -> {repr(tokenizer.decode([curr_divergent_token]))}"
+        )
+        print(
+            f"❌ Stored Cache Token  [{diverge_idx}]: ID {stor_divergent_token} -> {repr(tokenizer.decode([stor_divergent_token]))}"
+        )
 
-        curr_context_after = tokenizer.decode(current_tokens[diverge_idx+1:end_idx_current])
-        stor_context_after = tokenizer.decode(stored_tokens[diverge_idx+1:end_idx_stored])
+        curr_context_after = tokenizer.decode(
+            current_tokens[diverge_idx + 1 : end_idx_current]
+        )
+        stor_context_after = tokenizer.decode(
+            stored_tokens[diverge_idx + 1 : end_idx_stored]
+        )
         if len(curr_context_after) > max_text_len:
             curr_context_after = curr_context_after[:max_text_len] + "..."
         if len(stor_context_after) > max_text_len:
@@ -508,7 +592,7 @@ def _debug_token_divergence(tokenizer, current_tokens: List[int], stored_tokens:
         print(f"Stored context after:  {repr(stor_context_after)}")
     except Exception as e:
         print(f"Could not decode tokens: {e}")
-    print("="*50 + "\n")
+    print("=" * 50 + "\n")
 
 
 def _block_chain_hashes(
@@ -529,6 +613,7 @@ def _block_chain_hashes(
         prev = h
     return out
 
+
 class LRUPromptCache:
     @dataclass
     class CacheEntry:
@@ -541,7 +626,7 @@ class LRUPromptCache:
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
         self.block_size = max(16, getattr(SETTINGS, "prompt_cache_block_size", 16))
-        
+
         # Core Flat Cache: (model, exact_tokens) -> CacheEntry
         self._entries: Dict[Tuple[str, Tuple[int, ...]], self.CacheEntry] = {}
         # Block Hash Index: (model, chain_hash) -> Set of token sequences
@@ -562,7 +647,7 @@ class LRUPromptCache:
         key = (model, tuple(tokens))
         if key not in self._entries:
             return
-        
+
         # Clean up the block index to prevent memory leaks
         chain_pairs = _block_chain_hashes(tokens, self.block_size)
         for chain_hash, _ in chain_pairs:
@@ -571,7 +656,7 @@ class LRUPromptCache:
                 self._block_index[idx_key].discard(key[1])
                 if not self._block_index[idx_key]:
                     del self._block_index[idx_key]
-                    
+
         del self._entries[key]
 
     def _extract(self, model, tokens):
@@ -579,8 +664,13 @@ class LRUPromptCache:
         entry = self._entries[key]
         entry.touched_at = time.time()
         entry.count += 1  # Track hit frequency for eviction weighting
-        
-        return self.CacheEntry(copy.deepcopy(entry.prompt_cache), entry.tokens, entry.count, entry.touched_at)
+
+        return self.CacheEntry(
+            copy.deepcopy(entry.prompt_cache),
+            entry.tokens,
+            entry.count,
+            entry.touched_at,
+        )
 
     def _evict_optimal(self):
         """
@@ -593,15 +683,15 @@ class LRUPromptCache:
 
         for key, entry in self._entries.items():
             age_seconds = max(1.0, now - entry.touched_at)
-            
+
             # Use square root to create a balanced gravity for long chains.
             # A 10,000 token chain has 10x more protection than a 100 token chain.
             length_weight = math.sqrt(len(entry.tokens))
-            freq_weight = math.log1p(entry.count) + 1.0 
-            
+            freq_weight = math.log1p(entry.count) + 1.0
+
             # Higher score = more likely to be evicted. (Old and Short -> High Score)
             score = age_seconds / (length_weight * freq_weight)
-            
+
             if score > max_score:
                 max_score = score
                 best_key = key
@@ -611,21 +701,21 @@ class LRUPromptCache:
 
     def _cull_redundant_prefixes(self, model, new_tokens):
         """
-        Frees up slots by removing strict prefixes. Since the cache can trim 
+        Frees up slots by removing strict prefixes. Since the cache can trim
         longer chains to serve shorter ones, shorter strict prefixes are wasted slots.
         """
         new_len = len(new_tokens)
         to_delete = []
-        for (m, t_tup) in self._entries.keys():
+        for m, t_tup in self._entries.keys():
             if m == model and len(t_tup) < new_len:
                 # If the existing shorter cache is a strict prefix of the new one
-                if new_tokens[:len(t_tup)] == t_tup:
+                if new_tokens[: len(t_tup)] == t_tup:
                     to_delete.append((m, t_tup))
-        
+
         to_delete.sort(key=lambda x: len(x[1]), reverse=True)
         if to_delete:
             # Spare the longest prefix from deletion
-            to_delete.pop(0) 
+            to_delete.pop(0)
 
         for k in to_delete:
             self._delete(k[0], k[1])
@@ -641,7 +731,13 @@ class LRUPromptCache:
             entry = self._extract(model, tokens_tup)
             if len(tokens_tup) > 1 and can_trim_prompt_cache(entry.prompt_cache):
                 trim_prompt_cache(entry.prompt_cache, 1)
-                return entry.prompt_cache, tokens_tup[-1:], tokens_tup, "exact", len(tokens_tup) - 1
+                return (
+                    entry.prompt_cache,
+                    tokens_tup[-1:],
+                    tokens_tup,
+                    "exact",
+                    len(tokens_tup) - 1,
+                )
             return entry.prompt_cache, [], tokens_tup, "exact", len(tokens_tup)
 
         # 1. Hash the incoming request into blocks
@@ -687,17 +783,33 @@ class LRUPromptCache:
             if len(best_cached_tokens) > len(tokens_tup):
                 if not can_trim_prompt_cache(entry.prompt_cache):
                     return None, tokens, tokens, "miss", 0
-                trim_prompt_cache(entry.prompt_cache, len(best_cached_tokens) - len(tokens_tup))
+                trim_prompt_cache(
+                    entry.prompt_cache, len(best_cached_tokens) - len(tokens_tup)
+                )
             if len(tokens_tup) > 1 and can_trim_prompt_cache(entry.prompt_cache):
                 trim_prompt_cache(entry.prompt_cache, 1)
-                return entry.prompt_cache, tokens_tup[-1:], best_cached_tokens, "exact", len(tokens_tup) - 1
+                return (
+                    entry.prompt_cache,
+                    tokens_tup[-1:],
+                    best_cached_tokens,
+                    "exact",
+                    len(tokens_tup) - 1,
+                )
             return entry.prompt_cache, [], best_cached_tokens, "exact", len(tokens_tup)
 
         if best_prefix_len < len(tokens_tup):
             # Shorter Match (We have the prefix, compute the rest)
             if can_trim_prompt_cache(entry.prompt_cache):
-                trim_prompt_cache(entry.prompt_cache, len(best_cached_tokens) - best_prefix_len)
-            return entry.prompt_cache, list(tokens_tup)[best_prefix_len:], best_cached_tokens, "shorter", best_prefix_len
+                trim_prompt_cache(
+                    entry.prompt_cache, len(best_cached_tokens) - best_prefix_len
+                )
+            return (
+                entry.prompt_cache,
+                list(tokens_tup)[best_prefix_len:],
+                best_cached_tokens,
+                "shorter",
+                best_prefix_len,
+            )
 
         # Longer cache: request is a strict prefix of cached; trim cache to request length
         if can_trim_prompt_cache(entry.prompt_cache):
@@ -706,13 +818,12 @@ class LRUPromptCache:
             return entry.prompt_cache, [], best_cached_tokens, "longer", len(tokens_tup)
         return None, tokens, tokens, "miss", 0
 
-
     def insert_cache(self, model, tokens, prompt_cache):
         self.prune_expired()
         tokens_tup = tuple(tokens)
         key = (model, tokens_tup)
         now = time.time()
-        
+
         if key in self._entries:
             self._entries[key].count += 1
             self._entries[key].touched_at = now
@@ -723,7 +834,7 @@ class LRUPromptCache:
 
         # 2. Insert into flat dictionary
         self._entries[key] = self.CacheEntry(prompt_cache, tokens_tup, 1, now)
-        
+
         # 3. Map block hashes
         chain_pairs = _block_chain_hashes(tokens_tup, self.block_size)
         for chain_hash, _ in chain_pairs:
@@ -745,10 +856,12 @@ class LRUPromptCache:
             return None
         return self._extract(model, tuple(tokens))
 
+
 PROMPT_CACHE = LRUPromptCache(
     max_size=SETTINGS.prompt_cache_max_entries_global,
     ttl_seconds=SETTINGS.prompt_cache_ttl_seconds,
 )
+
 
 @dataclass(frozen=True)
 class SessionContext:
@@ -809,7 +922,9 @@ class SessionIndex:
         return idx
 
     @staticmethod
-    def _append_unique_bounded(queue: deque, key_tuple: Tuple[int, ...], limit: int) -> None:
+    def _append_unique_bounded(
+        queue: deque, key_tuple: Tuple[int, ...], limit: int
+    ) -> None:
         try:
             queue.remove(key_tuple)
         except ValueError:
@@ -818,7 +933,9 @@ class SessionIndex:
         while len(queue) > limit:
             queue.popleft()
 
-    def register_cache_key(self, session_ctx: SessionContext, cache_key: List[int]) -> None:
+    def register_cache_key(
+        self, session_ctx: SessionContext, cache_key: List[int]
+    ) -> None:
         self._prune_idle()
         session_id = (session_ctx.session_id or "").strip()
         if not session_id:
@@ -834,12 +951,17 @@ class SessionIndex:
             )
             self._sessions[session_id] = state
 
-        if session_ctx.parent_session_id and session_ctx.parent_session_id != session_id:
+        if (
+            session_ctx.parent_session_id
+            and session_ctx.parent_session_id != session_id
+        ):
             state.parent_session_id = session_ctx.parent_session_id
         state.touched_at = time.time()
 
         key_tuple = tuple(cache_key)
-        self._append_unique_bounded(state.keys, key_tuple, self._max_entries_per_session)
+        self._append_unique_bounded(
+            state.keys, key_tuple, self._max_entries_per_session
+        )
 
         # Keep additional anchor prefixes so branch returns can reuse older stable
         # points even when recent keys are from another branch/tool-heavy turn.
@@ -851,7 +973,9 @@ class SessionIndex:
             if (len(key_tuple) - last_anchor_len) >= self._anchor_stride_tokens:
                 should_add_anchor = True
         if should_add_anchor:
-            self._append_unique_bounded(state.anchors, key_tuple, self._max_anchor_entries)
+            self._append_unique_bounded(
+                state.anchors, key_tuple, self._max_anchor_entries
+            )
 
     def _selection_from_exact_entry(
         self,
@@ -869,7 +993,9 @@ class SessionIndex:
             trim_prompt_cache(cache_entry.prompt_cache, len(cache_tokens) - prefix_len)
 
         if prefix_len == len(prompt_tokens):
-            if len(prompt_tokens) > 1 and can_trim_prompt_cache(cache_entry.prompt_cache):
+            if len(prompt_tokens) > 1 and can_trim_prompt_cache(
+                cache_entry.prompt_cache
+            ):
                 trim_prompt_cache(cache_entry.prompt_cache, 1)
                 return (
                     cache_entry.prompt_cache,
@@ -914,6 +1040,272 @@ SESSION_INDEX = SessionIndex(
 )
 
 
+# --- MESSAGE-AWARE STABLE-PREFIX CACHE (Phase 2) ---
+
+
+@dataclass
+class _SessionTurnRecord:
+    """Lightweight per-session record of the last completed turn's message structure."""
+
+    messages: List[Dict[str, Any]]  # normalised message list used for diff key
+    msg_token_lens: List[int]  # token count for each message (in order)
+    total_prompt_tokens: (
+        int  # sum(msg_token_lens); equals len(prompt_tokens) for that turn
+    )
+    touched_at: float
+
+
+# Global store: session_id -> _SessionTurnRecord
+# Protected by prompt_cache_lock (same lock used for PROMPT_CACHE).
+SESSION_TURN_STORE: Dict[str, _SessionTurnRecord] = {}
+_SESSION_TURN_MAX_IDLE_SECONDS: int = SETTINGS.prompt_cache_session_max_idle_seconds
+
+
+def _normalize_message_content_for_diff(msg: Dict[str, Any]) -> str:
+    """
+    Return a normalised string representation of a message's content for use
+    ONLY as a diff key. The original message is never modified.
+
+    Currently strips:
+    - Leading/trailing whitespace differences (trailing space is a real FP-1 trigger)
+    - No other normalisation until confirmed from real OpenCode/OpenClaw logs.
+
+    M4 IMPLEMENTATION NOTE: When real session logs from OpenCode/OpenClaw are
+    audited, add confirmed volatile-field stripping here (timestamps, system-reminder
+    injections, etc.). The existing _normalize_prompt_for_cache() patterns are a
+    starting point but are applied at the serialised-string level — they need to be
+    adapted here at the per-message level after real-traffic confirmation.
+    """
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        # Multi-part content (e.g. VLM image+text). Use JSON with stripped text parts.
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    parts.append({"type": "text", "text": part.get("text", "").strip()})
+                else:
+                    parts.append(part)
+            else:
+                parts.append(part)
+        return json.dumps(parts, sort_keys=True, ensure_ascii=False)
+    return json.dumps(content, sort_keys=True, ensure_ascii=False)
+
+
+def _message_diff(
+    prev_msgs: List[Dict[str, Any]],
+    curr_msgs: List[Dict[str, Any]],
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """
+    Diff two message lists at message-boundary level.
+
+    Returns:
+        stable_prefix_count (int): number of messages from the START of both lists
+            that are normalisation-identical in role and content. These messages'
+            KV state can be safely reused.
+        descriptors (list): list of change descriptors for telemetry/debugging.
+
+    Rules:
+    - Two messages are "equal" if their role is identical AND their normalised
+      content (_normalize_message_content_for_diff) is identical.
+    - Only the LEADING equal block contributes to stable_prefix_count.
+      If messages [0..K-1] are equal and message[K] differs, stable_prefix_count = K.
+    - Later equal blocks (after a change) are NOT counted — RoPE position
+      correctness requires contiguous prefix reuse only.
+    """
+    stable_prefix_count = 0
+    for i, (prev, curr) in enumerate(zip(prev_msgs, curr_msgs)):
+        if prev.get("role") == curr.get("role") and _normalize_message_content_for_diff(
+            prev
+        ) == _normalize_message_content_for_diff(curr):
+            stable_prefix_count = i + 1
+        else:
+            break
+
+    descriptors: List[Dict[str, Any]] = []
+    n = max(len(prev_msgs), len(curr_msgs))
+    for i in range(n):
+        p = prev_msgs[i] if i < len(prev_msgs) else None
+        c = curr_msgs[i] if i < len(curr_msgs) else None
+        if p is None:
+            descriptors.append({"idx": i, "op": "insert", "role": c.get("role")})
+        elif c is None:
+            descriptors.append({"idx": i, "op": "delete", "role": p.get("role")})
+        elif p.get("role") != c.get("role") or _normalize_message_content_for_diff(
+            p
+        ) != _normalize_message_content_for_diff(c):
+            descriptors.append(
+                {
+                    "idx": i,
+                    "op": "replace",
+                    "role_prev": p.get("role"),
+                    "role_curr": c.get("role"),
+                }
+            )
+
+    return stable_prefix_count, descriptors
+
+
+def _stable_prefix_token_len(
+    session_id: str,
+    curr_msgs: List[Dict[str, Any]],
+) -> Tuple[int, int, List[Dict[str, Any]]]:
+    """
+    For a given session and incoming message list, determine the stable prefix
+    in tokens by consulting the SESSION_TURN_STORE.
+
+    Returns:
+        stable_token_len (int): number of tokens at the start of the prompt that
+            are known-stable from the previous turn. 0 if no prior turn or no match.
+        stable_msg_count (int): number of leading messages that are stable.
+        descriptors (list): diff descriptors for telemetry.
+
+    Must be called while holding prompt_cache_lock (reads SESSION_TURN_STORE).
+    """
+    record = SESSION_TURN_STORE.get(session_id)
+    if record is None:
+        return 0, 0, []
+
+    stable_msg_count, descriptors = _message_diff(record.messages, curr_msgs)
+    if stable_msg_count == 0:
+        return 0, 0, descriptors
+
+    # Sum the token lengths of the stable prefix messages
+    stable_token_len = sum(record.msg_token_lens[:stable_msg_count])
+    return stable_token_len, stable_msg_count, descriptors
+
+
+def _compute_msg_token_boundaries(
+    messages: List[Dict[str, Any]],
+    prompt_tokens: List[int],
+) -> List[int]:
+    """
+    Compute accurate per-message token boundary lengths using cumulative chat-template
+    rendering. Each boundary is the cumulative token count up to and including that
+    message in the rendered prompt.
+
+    Strategy: render messages[0..i] (without generation prompt) through the actual
+    chat template and measure the token count. The per-message length is the diff
+    between consecutive cumulative counts.
+
+    Returns a list of per-message token counts (same length as messages).
+    The last message gets len(prompt_tokens) - sum(prev) as ground truth.
+
+    For VLM prompts: tokenizer may not have apply_chat_template; falls back to
+    equal distribution with last-message remainder correction.
+    """
+    n = len(messages)
+    if n == 0:
+        return []
+
+    msg_token_lens: List[int] = []
+
+    # Prefer apply_chat_template if available (gives exact boundaries)
+    if (
+        tokenizer is not None
+        and hasattr(tokenizer, "apply_chat_template")
+        and getattr(tokenizer, "chat_template", None) is not None
+        and not is_vlm
+    ):
+        try:
+            cumulative_lengths: List[int] = []
+            prev_len = 0
+            for i in range(n):
+                # Render prefix messages[0..i] without generation prompt so the
+                # boundary lands exactly at the end of message i.
+                # We suppress add_generation_prompt to avoid including the assistant
+                # start token in the boundary count.
+                prefix_toks = tokenizer.apply_chat_template(
+                    messages[: i + 1],
+                    tokenize=True,
+                    add_generation_prompt=False,
+                )
+                if isinstance(prefix_toks, list):
+                    cur_len = len(prefix_toks)
+                else:
+                    cur_len = prev_len
+                msg_token_lens.append(max(0, cur_len - prev_len))
+                prev_len = cur_len
+            # Correct the last bucket using the authoritative total (which includes
+            # the generation prompt tokens added at the end of the full render).
+            total = len(prompt_tokens)
+            if msg_token_lens:
+                prefix_sum = sum(msg_token_lens[:-1])
+                msg_token_lens[-1] = max(0, total - prefix_sum)
+            return msg_token_lens
+        except Exception:
+            pass  # Fall through to approximation
+
+    # Fallback: divide evenly, correct last bucket with remainder
+    per = len(prompt_tokens) // max(1, n)
+    msg_token_lens = [per] * (n - 1) + [max(0, len(prompt_tokens) - per * (n - 1))]
+    return msg_token_lens
+
+
+def _update_session_turn_store(
+    session_id: str,
+    messages: List[Dict[str, Any]],
+    prompt_tokens: List[int],
+) -> None:
+    """
+    Record the per-message token boundary information for this session's completed turn.
+    Must be called while holding prompt_cache_lock.
+
+    Per-message token lengths are computed via cumulative chat-template rendering
+    (_compute_msg_token_boundaries) to give exact boundaries. The stable-prefix
+    secondary lookup depends on these boundaries being accurate: if the boundary
+    is over-estimated, the lookup prefix extends into the next (changed) message
+    and the block-hash mismatches.
+    """
+    if not session_id or not messages:
+        return
+
+    # Prune stale entries
+    now = time.time()
+    stale = [
+        sid
+        for sid, rec in SESSION_TURN_STORE.items()
+        if (now - rec.touched_at) > _SESSION_TURN_MAX_IDLE_SECONDS
+    ]
+    for sid in stale:
+        del SESSION_TURN_STORE[sid]
+
+    # Guard: only write if the new message list is a strict append of the existing record.
+    # If the existing record's messages are NOT a prefix of the incoming list, this request
+    # is from a sub-agent or parallel branch that has a structurally different conversation
+    # history on the same session_id. Writing would clobber the orchestrator's record and
+    # corrupt the stable-prefix diff for the next orchestrator turn. Skip silently.
+    existing = SESSION_TURN_STORE.get(session_id)
+    if existing is not None:
+        prev = existing.messages
+        n_prev = len(prev)
+        if len(messages) < n_prev:
+            # Shorter than what we already have — definitely not an append. Skip.
+            return
+        for i in range(n_prev):
+            if prev[i].get("role") != messages[i].get(
+                "role"
+            ) or _normalize_message_content_for_diff(
+                prev[i]
+            ) != _normalize_message_content_for_diff(messages[i]):
+                # A prior message changed — this is not a linear continuation.
+                # The diff logic would still produce a valid (possibly lower) stable_prefix_count,
+                # but the stored record would now reflect a diverged branch. Skip to preserve
+                # the best-known linear record for this session.
+                return
+
+    msg_token_lens = _compute_msg_token_boundaries(messages, prompt_tokens)
+
+    SESSION_TURN_STORE[session_id] = _SessionTurnRecord(
+        messages=messages,
+        msg_token_lens=msg_token_lens,
+        total_prompt_tokens=len(prompt_tokens),
+        touched_at=now,
+    )
+
+
 class CacheSessionTranscriptLogger:
     def __init__(self, cache_session_id: str):
         now = datetime.now()
@@ -933,7 +1325,9 @@ class CacheSessionTranscriptLogger:
             f.write("\n")
 
     def log(self, direction, payload, request_id: str):
-        self._write_line(f"[{self._ts()}] request_id={request_id} direction={direction}")
+        self._write_line(
+            f"[{self._ts()}] request_id={request_id} direction={direction}"
+        )
         if isinstance(payload, (dict, list)):
             self._write_line(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
@@ -946,7 +1340,9 @@ def _cache_session_id(tokens: List[int]) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _cache_log_session_id(session_ctx: SessionContext, cache_session_tokens: List[int]) -> str:
+def _cache_log_session_id(
+    session_ctx: SessionContext, cache_session_tokens: List[int]
+) -> str:
     # Prefer stable conversation/session identifier for grouped diagnostics.
     session_raw = (session_ctx.session_id or "").strip()
     if session_raw:
@@ -1008,7 +1404,9 @@ def _prepare_messages_for_template(messages):
                                 f"lines={raw_content.count(chr(10)) + 1}__"
                             )
                         else:
-                            serialized = json.dumps(raw_content, ensure_ascii=False, sort_keys=True)
+                            serialized = json.dumps(
+                                raw_content, ensure_ascii=False, sort_keys=True
+                            )
                             raw_bytes = serialized.encode("utf-8")
                             digest = hashlib.sha1(raw_bytes).hexdigest()[:16]
                             placeholder = (
@@ -1049,6 +1447,7 @@ def _extract_images_from_messages(messages: List[Dict[str, Any]]) -> List[Any]:
     """
     import base64
     from io import BytesIO
+
     images = []
     for msg in messages:
         content = msg.get("content")
@@ -1063,7 +1462,13 @@ def _extract_images_from_messages(messages: List[Dict[str, Any]]) -> List[Any]:
                 url = u.get("url") if isinstance(u, dict) else None
             elif part.get("type") == "input_image":
                 u = part.get("input_image") or part.get("image_url") or {}
-                url = u.get("url") if isinstance(u, dict) else u if isinstance(u, str) else None
+                url = (
+                    u.get("url")
+                    if isinstance(u, dict)
+                    else u
+                    if isinstance(u, str)
+                    else None
+                )
             if not url or not isinstance(url, str):
                 continue
             url = url.strip()
@@ -1071,6 +1476,7 @@ def _extract_images_from_messages(messages: List[Dict[str, Any]]) -> List[Any]:
                 try:
                     _, b64 = url.split(",", 1)
                     from PIL import Image
+
                     img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
                     images.append(img)
                 except Exception:
@@ -1080,7 +1486,9 @@ def _extract_images_from_messages(messages: List[Dict[str, Any]]) -> List[Any]:
     return images
 
 
-def _prepare_messages_for_vlm(messages: List[Dict[str, Any]], tools: Optional[Any] = None) -> List[Dict[str, Any]]:
+def _prepare_messages_for_vlm(
+    messages: List[Dict[str, Any]], tools: Optional[Any] = None
+) -> List[Dict[str, Any]]:
     """
     Normalize messages for VLM: fix tool_calls like _prepare_messages_for_template,
     but preserve content as list (text + image_url) so get_chat_template can insert image tokens.
@@ -1093,7 +1501,7 @@ def _prepare_messages_for_vlm(messages: List[Dict[str, Any]], tools: Optional[An
             new_content = []
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
-                    text = (part.get("text") or part.get("content") or "")
+                    text = part.get("text") or part.get("content") or ""
                     if SETTINGS.cache_canonicalize_tool_context:
                         text = _normalize_prompt_for_cache(text)
                     new_content.append({**part, "text": text})
@@ -1124,6 +1532,7 @@ def _prepare_messages_for_vlm(messages: List[Dict[str, Any]], tools: Optional[An
         normalized.append(m)
     return normalized
 
+
 def _vlm_prompt_and_inputs(
     processor_any,
     config: Dict[str, Any],
@@ -1147,9 +1556,15 @@ def _vlm_prompt_and_inputs(
     if processor_any is not None and hasattr(processor_any, "apply_chat_template"):
         if getattr(processor_any, "chat_template", None) is not None:
             template_processor = processor_any
-    if template_processor is None and getattr(processor_any, "tokenizer", None) is not None:
+    if (
+        template_processor is None
+        and getattr(processor_any, "tokenizer", None) is not None
+    ):
         tok = processor_any.tokenizer
-        if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None) is not None:
+        if (
+            hasattr(tok, "apply_chat_template")
+            and getattr(tok, "chat_template", None) is not None
+        ):
             template_processor = tok
 
     formatted = ""
@@ -1166,7 +1581,7 @@ def _vlm_prompt_and_inputs(
             formatted = str(formatted)
         except Exception:
             formatted = ""
-            
+
     # Fallback to mlx_vlm's get_chat_template if HF template fails/is missing
     if not formatted:
         out = get_chat_template(
@@ -1191,12 +1606,13 @@ def _vlm_prompt_and_inputs(
         add_special_tokens=True,
         return_tensors="mlx",
     )
-    
+
     input_ids = inputs.get("input_ids")
     pixel_values = inputs.get("pixel_values")
     mask = inputs.get("attention_mask")
-    
+
     return input_ids, pixel_values, mask
+
 
 def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
     """
@@ -1204,12 +1620,13 @@ def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
     """
     try:
         import torch
+
         if hasattr(torch, "mps") and torch.backends.mps.is_available():
             torch.mps.synchronize()
-            torch.mps.empty_cache() # CRITICAL: Force PyTorch to release all Metal encoders
+            torch.mps.empty_cache()  # CRITICAL: Force PyTorch to release all Metal encoders
     except Exception:
         pass
-        
+
     to_eval = []
     if pixel_values is not None and hasattr(pixel_values, "shape"):
         to_eval.append(pixel_values)
@@ -1218,6 +1635,7 @@ def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
     if to_eval:
         try:
             import mlx.core as mx
+
             mx.eval(*to_eval)
         except Exception:
             pass
@@ -1345,6 +1763,7 @@ def _extract_enable_thinking(body: Dict[str, Any]) -> Dict[str, Any]:
         "raw": None,
     }
 
+
 def _normalize_assistant_text(text, enable_thinking, model_family):
     if not isinstance(text, str):
         return text
@@ -1356,12 +1775,14 @@ def _normalize_assistant_text(text, enable_thinking, model_family):
         return "<think>" + text
     return text
 
+
 def _coerce_arg_value(raw_value):
     value = raw_value.strip()
     try:
         return json.loads(value)
     except Exception:
         return value
+
 
 def _extract_openai_tool_calls(text, model_family):
     if not isinstance(text, str) or "<tool_call>" not in text:
@@ -1447,6 +1868,7 @@ def _extract_openai_tool_calls(text, model_family):
     cleaned_text = "".join(cleaned_parts).strip()
     return cleaned_text, tool_calls
 
+
 def _tokenize_prompt(prompt):
     if isinstance(prompt, str):
         add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(
@@ -1502,7 +1924,7 @@ def _normalize_prompt_for_cache(prompt):
     if not SETTINGS.cache_canonicalize_tool_context:
         return prompt
     normalized = INBOUND_META_MESSAGE_ID_PATTERN.sub(
-        r'\1__CACHE_STABLE_MESSAGE_ID__\2',
+        r"\1__CACHE_STABLE_MESSAGE_ID__\2",
         prompt,
     )
     if INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN.search(normalized):
@@ -1534,8 +1956,12 @@ def _normalize_prompt_for_cache(prompt):
     return normalized
 
 
-def _extract_session_context(body: Dict[str, Any], prompt_tokens: List[int]) -> SessionContext:
-    def _read_any_id(container: Optional[Dict[str, Any]], keys: List[str]) -> Optional[str]:
+def _extract_session_context(
+    body: Dict[str, Any], prompt_tokens: List[int]
+) -> SessionContext:
+    def _read_any_id(
+        container: Optional[Dict[str, Any]], keys: List[str]
+    ) -> Optional[str]:
         if not isinstance(container, dict):
             return None
         for key in keys:
@@ -1618,8 +2044,12 @@ def _build_sampler(body):
         "top_p": body.get("top_p", SETTINGS.default_top_p),
         "top_k": body.get("top_k", SETTINGS.default_top_k),
         "min_p": body.get("min_p", SETTINGS.default_min_p),
-        "repetition_penalty": body.get("repetition_penalty", SETTINGS.default_repetition_penalty),
-        "repetition_context_size": body.get("repetition_context_size", SETTINGS.default_repetition_context_size),
+        "repetition_penalty": body.get(
+            "repetition_penalty", SETTINGS.default_repetition_penalty
+        ),
+        "repetition_context_size": body.get(
+            "repetition_context_size", SETTINGS.default_repetition_context_size
+        ),
     }
 
     # Some mlx_lm versions don't support all params. Drop unsupported keys progressively.
@@ -1698,7 +2128,9 @@ def _stop_stale_litellm_on_proxy_port(port: int) -> None:
         except OSError:
             continue
     if stopped_any:
-        _terminal_status("♻️", f"Stopped stale LiteLLM process(es) on port {port} before restart.")
+        _terminal_status(
+            "♻️", f"Stopped stale LiteLLM process(es) on port {port} before restart."
+        )
 
 
 def start_litellm_proxy():
@@ -1759,28 +2191,35 @@ litellm_settings:
                 "--port",
                 str(SETTINGS.proxy_port),
             ]
-    
+
     my_env = os.environ.copy()
     my_env["OPENAI_API_KEY"] = "local"
     proxy_process = subprocess.Popen(
-        cmd,
-        env=my_env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE
+        cmd, env=my_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
     )
     time.sleep(SETTINGS.proxy_startup_wait_seconds)
     if proxy_process.poll() is not None:
         stderr_output = ""
         if proxy_process.stderr is not None:
             try:
-                stderr_output = proxy_process.stderr.read().decode("utf-8", errors="replace")
+                stderr_output = proxy_process.stderr.read().decode(
+                    "utf-8", errors="replace"
+                )
             except Exception:
                 stderr_output = ""
         raise RuntimeError(
             "LiteLLM proxy failed to start. "
-            + (f"stderr: {stderr_output.strip()}" if stderr_output else "No stderr captured.")
+            + (
+                f"stderr: {stderr_output.strip()}"
+                if stderr_output
+                else "No stderr captured."
+            )
         )
-    _terminal_status("✅", f"LiteLLM Proxy ready at http://127.0.0.1:{SETTINGS.proxy_port} (model: {SETTINGS.proxy_model_id})")
+    _terminal_status(
+        "✅",
+        f"LiteLLM Proxy ready at http://127.0.0.1:{SETTINGS.proxy_port} (model: {SETTINGS.proxy_model_id})",
+    )
+
 
 def cleanup():
     global proxy_config_path
@@ -1795,6 +2234,7 @@ def cleanup():
             pass
     _terminal_status("👋", "MLX Server stopped.")
 
+
 atexit.register(cleanup)
 
 # Model loading: LM or VLM based on config.
@@ -1804,7 +2244,10 @@ processor = None
 is_vlm = False
 vlm_config = None
 
-_terminal_status("🚀", f"Loading model: {SETTINGS.model_path} (exposed as: {SETTINGS.proxy_model_id})")
+_terminal_status(
+    "🚀",
+    f"Loading model: {SETTINGS.model_path} (exposed as: {SETTINGS.proxy_model_id})",
+)
 _resolved_path, _config = _resolve_model_path_and_config()
 if _config and _is_vlm_config(_config):
     if not mlx_vlm_available:
@@ -1818,13 +2261,17 @@ if _config and _is_vlm_config(_config):
     try:
         import importlib
         from transformers.models.auto import video_processing_auto as _vpa
-        from transformers.models.auto.configuration_auto import model_type_to_module_name
+        from transformers.models.auto.configuration_auto import (
+            model_type_to_module_name,
+        )
 
         def _patched_video_processor_class_from_name(class_name: str):
             for module_name, extractors in _vpa.VIDEO_PROCESSOR_MAPPING_NAMES.items():
                 if extractors is not None and class_name in extractors:
                     mod_name = model_type_to_module_name(module_name)
-                    module = importlib.import_module(f".{mod_name}", "transformers.models")
+                    module = importlib.import_module(
+                        f".{mod_name}", "transformers.models"
+                    )
                     try:
                         return getattr(module, class_name)
                     except AttributeError:
@@ -1840,15 +2287,20 @@ if _config and _is_vlm_config(_config):
         _vpa.video_processor_class_from_name = _patched_video_processor_class_from_name
     except Exception:
         pass
-    model, processor = load_vlm(SETTINGS.model_path, tokenizer_config={"trust_remote_code": True})
+    model, processor = load_vlm(
+        SETTINGS.model_path, tokenizer_config={"trust_remote_code": True}
+    )
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     is_vlm = True
-    vlm_config = _config if isinstance(_config, dict) else getattr(model, "config", None)
+    vlm_config = (
+        _config if isinstance(_config, dict) else getattr(model, "config", None)
+    )
     if vlm_config is None and hasattr(model, "config"):
         vlm_config = getattr(model.config, "__dict__", None) or {}
     _terminal_status("✅", "VLM model loaded (mlx-vlm).")
     try:
         from transformers.utils import is_torchvision_available
+
         if is_torchvision_available():
             _terminal_status(
                 "⚡",
@@ -1861,9 +2313,13 @@ if _config and _is_vlm_config(_config):
                 "Torch acceleration: disabled. Install mlx-vlm[torch] for much faster image processing.",
             )
     except Exception:
-        _terminal_status("⚠️", "Torch acceleration: unknown (torch/torchvision not detected).")
+        _terminal_status(
+            "⚠️", "Torch acceleration: unknown (torch/torchvision not detected)."
+        )
 else:
-    model, tokenizer = load(SETTINGS.model_path, tokenizer_config={"trust_remote_code": True})
+    model, tokenizer = load(
+        SETTINGS.model_path, tokenizer_config={"trust_remote_code": True}
+    )
     _terminal_status("✅", "Model loaded (mlx-lm).")
     _terminal_status("⚡", "Torch acceleration: N/A (text-only model).")
 _terminal_status(
@@ -1894,26 +2350,40 @@ def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
     return kwargs
 
 
-def _stream_generate_unified(rest_tokens, max_tokens, sampler, prompt_cache, vlm_pixel_values=None, vlm_mask=None, cache_match_type="miss"):
+def _stream_generate_unified(
+    rest_tokens,
+    max_tokens,
+    sampler,
+    prompt_cache,
+    vlm_pixel_values=None,
+    vlm_mask=None,
+    cache_match_type="miss",
+):
     """
     Yields response objects with .text and .token (LM: GenerationResponse, VLM: GenerationResult).
     Dynamically checks for image tokens in rest_tokens to prevent Metal Segmentation Faults.
     """
     if is_vlm:
         # Prevent Segfault: We MUST pass vision tensors if rest_tokens contains image placeholders.
-        # If we have a massive chunk of rest_tokens (e.g., > 100) on a 'shorter' hit, 
+        # If we have a massive chunk of rest_tokens (e.g., > 100) on a 'shorter' hit,
         # it almost certainly contains the system/user image tokens.
         has_image_tokens = False
         if rest_tokens:
             # Check for common Qwen3/GLM vision token IDs, or fallback to length heuristic
-            vision_tokens = {151652, 151653, 151654, 151655} # Common Qwen vision IDs
+            vision_tokens = {151652, 151653, 151654, 151655}  # Common Qwen vision IDs
             has_image_tokens = any(tok in vision_tokens for tok in rest_tokens)
             if not has_image_tokens and len(rest_tokens) > 100:
                 has_image_tokens = True
 
-        use_vision = (cache_match_type == "miss" or has_image_tokens) and vlm_pixel_values is not None
-        
-        rest_ids = mx.array([rest_tokens], dtype=mx.int32) if rest_tokens else mx.array([[0]], dtype=mx.int32)
+        use_vision = (
+            cache_match_type == "miss" or has_image_tokens
+        ) and vlm_pixel_values is not None
+
+        rest_ids = (
+            mx.array([rest_tokens], dtype=mx.int32)
+            if rest_tokens
+            else mx.array([[0]], dtype=mx.int32)
+        )
         kwargs = {
             "input_ids": rest_ids,
             "pixel_values": vlm_pixel_values if use_vision else None,
@@ -1929,8 +2399,11 @@ def _stream_generate_unified(rest_tokens, max_tokens, sampler, prompt_cache, vlm
         for resp in stream_generate_vlm(model, processor, "", image=None, **kwargs):
             yield resp
     else:
-        for resp in stream_generate(**_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)):
+        for resp in stream_generate(
+            **_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)
+        ):
             yield resp
+
 
 class APIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -2056,13 +2529,29 @@ class APIHandler(BaseHTTPRequestHandler):
         generation_started_at = None
         first_token_at = None
         queue_started_at = time.time()
+
+        # --- STABLE-PREFIX TELEMETRY DEFAULTS ---
+        stable_prefix_token_len_computed = 0
+        stable_prefix_msg_count_computed = 0
+        stable_prefix_diff_descriptors: List[Dict[str, Any]] = []
+
         try:
             model_lock.acquire(blocking=True)
             acquired = True
-            
+
             generation_started_at = time.time()
             wait_seconds = generation_started_at - queue_started_at
             with prompt_cache_lock:
+                # --- M2: Compute stable prefix from message-level diff ---
+                _session_id_for_turn = (session_ctx.session_id or "").strip()
+                if _session_id_for_turn:
+                    (
+                        stable_prefix_token_len_computed,
+                        stable_prefix_msg_count_computed,
+                        stable_prefix_diff_descriptors,
+                    ) = _stable_prefix_token_len(_session_id_for_turn, messages)
+
+                # --- Standard global cache lookup ---
                 (
                     prompt_cache,
                     rest_tokens,
@@ -2077,21 +2566,95 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt_cache_store=PROMPT_CACHE,
                 )
 
+                # --- M3: Stable-prefix fallback ---
+                # If the global cache lookup found fewer cached tokens than the
+                # message-level diff says are stable, try a secondary lookup
+                # using the stable prefix as the minimum acceptable match.
+                # Only triggers when there is a real improvement available.
+                if (
+                    stable_prefix_token_len_computed > matched_prefix_len
+                    and stable_prefix_token_len_computed > 0
+                    and stable_prefix_token_len_computed < len(prompt_tokens)
+                ):
+                    # Try to find a cache entry that covers at least stable_prefix_token_len_computed tokens.
+                    # We look up the stable prefix tokens directly.
+                    stable_prefix_toks = prompt_tokens[
+                        :stable_prefix_token_len_computed
+                    ]
+                    (
+                        sp_cache,
+                        sp_rest_tokens,
+                        sp_cache_session_tokens,
+                        sp_match_type,
+                        sp_matched_prefix_len,
+                    ) = PROMPT_CACHE.fetch_nearest_cache(
+                        SETTINGS.model_path, stable_prefix_toks
+                    )
+                    if (
+                        sp_cache is not None
+                        and sp_matched_prefix_len > matched_prefix_len
+                    ):
+                        # The stable-prefix lookup gives a better hit.
+                        # Trim the cache to the stable prefix boundary and re-prefill the rest.
+                        if sp_matched_prefix_len < stable_prefix_token_len_computed:
+                            # Partial hit on the stable prefix: still better than before
+                            trim_amount = (
+                                len(stable_prefix_toks) - sp_matched_prefix_len
+                            )
+                            if trim_amount > 0 and can_trim_prompt_cache(sp_cache):
+                                trim_prompt_cache(sp_cache, trim_amount)
+                            rest_tokens = prompt_tokens[sp_matched_prefix_len:]
+                        else:
+                            # Full stable-prefix hit: re-prefill only the new suffix
+                            # Trim the cache back to exactly stable_prefix_token_len_computed
+                            # (sp_matched_prefix_len may be > stable_prefix_token_len_computed
+                            # if the cache also covers some new tokens — that's fine, trim to SP boundary)
+                            if sp_matched_prefix_len > stable_prefix_token_len_computed:
+                                trim_amount = (
+                                    sp_matched_prefix_len
+                                    - stable_prefix_token_len_computed
+                                )
+                                if can_trim_prompt_cache(sp_cache):
+                                    trim_prompt_cache(sp_cache, trim_amount)
+                                sp_matched_prefix_len = stable_prefix_token_len_computed
+                            rest_tokens = prompt_tokens[sp_matched_prefix_len:]
+                        prompt_cache = sp_cache
+                        cache_session_tokens = sp_cache_session_tokens
+                        matched_prefix_len = sp_matched_prefix_len
+                        cache_match_type = "stable_prefix_" + sp_match_type
+                        cache_selection_source = "stable_prefix"
+
             # --- DEBUG BLOCK ---
-            if SETTINGS.vlm_cache_debug and cache_session_tokens and cache_match_type in ("shorter", "miss"):
+            if (
+                SETTINGS.vlm_cache_debug
+                and cache_session_tokens
+                and cache_match_type in ("shorter", "miss")
+            ):
                 # Compare the prompt against the actual candidate the global cache evaluated
-                _debug_token_divergence(tokenizer, prompt_tokens, cache_session_tokens, context_window=8)
+                _debug_token_divergence(
+                    tokenizer, prompt_tokens, cache_session_tokens, context_window=8
+                )
             # -----------------------
 
             if prompt_cache is None:
-                cache_model = model.language_model if is_vlm and hasattr(model, "language_model") else model
-                prompt_cache = make_prompt_cache(cache_model, max_kv_size=SETTINGS.max_kv_size)
+                cache_model = (
+                    model.language_model
+                    if is_vlm and hasattr(model, "language_model")
+                    else model
+                )
+                prompt_cache = make_prompt_cache(
+                    cache_model, max_kv_size=SETTINGS.max_kv_size
+                )
                 rest_tokens = prompt_tokens
-            rest_count = len(rest_tokens) if rest_tokens is not None else len(prompt_tokens)
+            rest_count = (
+                len(rest_tokens) if rest_tokens is not None else len(prompt_tokens)
+            )
             cache_session_id = _cache_log_session_id(session_ctx, cache_session_tokens)
             if SETTINGS.enable_request_logging:
                 try:
-                    request_logger = CacheSessionTranscriptLogger(cache_session_id=cache_session_id)
+                    request_logger = CacheSessionTranscriptLogger(
+                        cache_session_id=cache_session_id
+                    )
                 except Exception:
                     request_logger = None
 
@@ -2104,8 +2667,12 @@ class APIHandler(BaseHTTPRequestHandler):
                             "stream": bool(body.get("stream", False)),
                             "model": body.get("model", SETTINGS.proxy_model_id),
                             "model_family": SETTINGS.model_family,
-                            "temperature": body.get("temperature", SETTINGS.default_temperature),
-                            "max_tokens": body.get("max_tokens", SETTINGS.default_max_tokens),
+                            "temperature": body.get(
+                                "temperature", SETTINGS.default_temperature
+                            ),
+                            "max_tokens": body.get(
+                                "max_tokens", SETTINGS.default_max_tokens
+                            ),
                             "enable_thinking": enable_thinking,
                             "thinking_source": reasoning_control["source"],
                             "thinking_raw": reasoning_control["raw"],
@@ -2119,6 +2686,12 @@ class APIHandler(BaseHTTPRequestHandler):
                             "parent_session_id": session_ctx.parent_session_id,
                             "branch_id": session_ctx.branch_id,
                             "session_source": session_ctx.source,
+                            # --- M6 telemetry: stable-prefix metrics ---
+                            "stable_prefix_msg_count": stable_prefix_msg_count_computed,
+                            "stable_prefix_token_len": stable_prefix_token_len_computed,
+                            "stable_prefix_diff": stable_prefix_diff_descriptors[
+                                :8
+                            ],  # cap to avoid log bloat
                             **(
                                 {
                                     "vlm_format_prefix_stable": getattr(
@@ -2146,8 +2719,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 request_logger.log("sampler", sampler_payload, request_id=request_id)
 
             prompt_len = len(prompt_tokens)
-            hit_ratio = (matched_prefix_len / prompt_len * 100) if prompt_len > 0 else 0.0
-            
+            hit_ratio = (
+                (matched_prefix_len / prompt_len * 100) if prompt_len > 0 else 0.0
+            )
+
             if hit_ratio >= 85:
                 cache_light = "🟢"
             elif hit_ratio >= 50:
@@ -2176,14 +2751,22 @@ class APIHandler(BaseHTTPRequestHandler):
                 generated_parts = []
                 progress_last_at = time.time()
                 for response in _stream_generate_unified(
-                    rest_tokens, max_tokens, sampler, prompt_cache,
-                    vlm_pixel_values=vlm_pixel_values, vlm_mask=vlm_mask, cache_match_type=cache_match_type,
+                    rest_tokens,
+                    max_tokens,
+                    sampler,
+                    prompt_cache,
+                    vlm_pixel_values=vlm_pixel_values,
+                    vlm_mask=vlm_mask,
+                    cache_match_type=cache_match_type,
                 ):
                     generated_parts.append(response.text)
                     generated_tokens.append(int(response.token))
                     if first_token_at is None:
                         first_token_at = time.time()
-                    if len(generated_tokens) % 64 == 0 and (time.time() - progress_last_at) >= 1.0:
+                    if (
+                        len(generated_tokens) % 64 == 0
+                        and (time.time() - progress_last_at) >= 1.0
+                    ):
                         progress_last_at = time.time()
                         _terminal_status(
                             "⏳",
@@ -2223,6 +2806,13 @@ class APIHandler(BaseHTTPRequestHandler):
                         generated_tokens=generated_tokens,
                         tool_calls=tool_calls,
                     )
+                    # --- M5: Update session turn record for next-turn stable-prefix lookup ---
+                    if _session_id_for_turn:
+                        _update_session_turn_store(
+                            _session_id_for_turn,
+                            messages,
+                            prompt_tokens,
+                        )
 
                 response_id = f"chatcmpl-{int(time.time())}"
                 full_response = {
@@ -2230,19 +2820,18 @@ class APIHandler(BaseHTTPRequestHandler):
                     "object": "chat.completion",
                     "created": int(time.time()),
                     "model": SETTINGS.proxy_model_id,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": message_text
-                        },
-                        "finish_reason": finish_reason
-                    }],
-                    "usage": { 
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": message_text},
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "usage": {
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
-                        "total_tokens": 0
-                    }
+                        "total_tokens": 0,
+                    },
                 }
                 if tool_calls:
                     full_response["choices"][0]["message"]["tool_calls"] = tool_calls
@@ -2250,10 +2839,20 @@ class APIHandler(BaseHTTPRequestHandler):
                 if request_logger:
                     timing = {}
                     if first_token_at is not None and generation_started_at is not None:
-                        timing["prefill_seconds"] = first_token_at - generation_started_at
+                        timing["prefill_seconds"] = (
+                            first_token_at - generation_started_at
+                        )
                         timing["decode_seconds"] = time.time() - first_token_at
-                        timing["prefill_tps"] = rest_count / timing["prefill_seconds"] if timing["prefill_seconds"] > 0 else None
-                        timing["decode_tps"] = len(generated_tokens) / timing["decode_seconds"] if timing["decode_seconds"] > 0 else None
+                        timing["prefill_tps"] = (
+                            rest_count / timing["prefill_seconds"]
+                            if timing["prefill_seconds"] > 0
+                            else None
+                        )
+                        timing["decode_tps"] = (
+                            len(generated_tokens) / timing["decode_seconds"]
+                            if timing["decode_seconds"] > 0
+                            else None
+                        )
                     request_logger.log(
                         "generation",
                         {
@@ -2281,7 +2880,13 @@ class APIHandler(BaseHTTPRequestHandler):
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": SETTINGS.proxy_model_id,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant"},
+                            "finish_reason": None,
+                        }
+                    ],
                 }
                 self.wfile.write(f"data: {json.dumps(role_chunk)}\n\n".encode("utf-8"))
                 self.wfile.flush()
@@ -2289,8 +2894,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 raw_parts = []
                 progress_last_at = time.time()
                 for response in _stream_generate_unified(
-                    rest_tokens, max_tokens, sampler, prompt_cache,
-                    vlm_pixel_values=vlm_pixel_values, vlm_mask=vlm_mask, cache_match_type=cache_match_type,
+                    rest_tokens,
+                    max_tokens,
+                    sampler,
+                    prompt_cache,
+                    vlm_pixel_values=vlm_pixel_values,
+                    vlm_mask=vlm_mask,
+                    cache_match_type=cache_match_type,
                 ):
                     generated_tokens.append(int(response.token))
                     if first_token_at is None:
@@ -2298,7 +2908,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     response_text = response.text
                     if response_text:
                         raw_parts.append(response_text)
-                    if len(generated_tokens) % 64 == 0 and (time.time() - progress_last_at) >= 1.0:
+                    if (
+                        len(generated_tokens) % 64 == 0
+                        and (time.time() - progress_last_at) >= 1.0
+                    ):
                         progress_last_at = time.time()
                         _terminal_status(
                             "⏳",
@@ -2338,6 +2951,13 @@ class APIHandler(BaseHTTPRequestHandler):
                         generated_tokens=generated_tokens,
                         tool_calls=tool_calls,
                     )
+                    # --- M5: Update session turn record for next-turn stable-prefix lookup ---
+                    if _session_id_for_turn:
+                        _update_session_turn_store(
+                            _session_id_for_turn,
+                            messages,
+                            prompt_tokens,
+                        )
 
                 if message_text:
                     chunk = {
@@ -2345,7 +2965,13 @@ class APIHandler(BaseHTTPRequestHandler):
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": SETTINGS.proxy_model_id,
-                        "choices": [{"index": 0, "delta": {"content": message_text}, "finish_reason": None}],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": message_text},
+                                "finish_reason": None,
+                            }
+                        ],
                     }
                     self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
                     self.wfile.flush()
@@ -2357,13 +2983,17 @@ class APIHandler(BaseHTTPRequestHandler):
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
                             "model": SETTINGS.proxy_model_id,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"tool_calls": [{**tc, "index": idx}]},
-                                "finish_reason": None,
-                            }],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"tool_calls": [{**tc, "index": idx}]},
+                                    "finish_reason": None,
+                                }
+                            ],
                         }
-                        self.wfile.write(f"data: {json.dumps(tc_chunk)}\n\n".encode("utf-8"))
+                        self.wfile.write(
+                            f"data: {json.dumps(tc_chunk)}\n\n".encode("utf-8")
+                        )
                         self.wfile.flush()
 
                 finish_reason = "tool_calls" if tool_calls else "stop"
@@ -2372,17 +3002,29 @@ class APIHandler(BaseHTTPRequestHandler):
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": SETTINGS.proxy_model_id,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                    ],
                 }
                 self.wfile.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
                 self.wfile.write(b"data: [DONE]\n\n")
                 if request_logger:
                     timing = {}
                     if first_token_at is not None and generation_started_at is not None:
-                        timing["prefill_seconds"] = first_token_at - generation_started_at
+                        timing["prefill_seconds"] = (
+                            first_token_at - generation_started_at
+                        )
                         timing["decode_seconds"] = time.time() - first_token_at
-                        timing["prefill_tps"] = rest_count / timing["prefill_seconds"] if timing["prefill_seconds"] > 0 else None
-                        timing["decode_tps"] = len(generated_tokens) / timing["decode_seconds"] if timing["decode_seconds"] > 0 else None
+                        timing["prefill_tps"] = (
+                            rest_count / timing["prefill_seconds"]
+                            if timing["prefill_seconds"] > 0
+                            else None
+                        )
+                        timing["decode_tps"] = (
+                            len(generated_tokens) / timing["decode_seconds"]
+                            if timing["decode_seconds"] > 0
+                            else None
+                        )
                     request_logger.log(
                         "generation",
                         {
@@ -2398,9 +3040,17 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
 
         except BrokenPipeError:
-            _terminal_status("⚠️", f"Request {request_id} client disconnected (BrokenPipeError)", indent=1)
+            _terminal_status(
+                "⚠️",
+                f"Request {request_id} client disconnected (BrokenPipeError)",
+                indent=1,
+            )
             if request_logger:
-                request_logger.log("generation", "client disconnected (BrokenPipeError)", request_id=request_id)
+                request_logger.log(
+                    "generation",
+                    "client disconnected (BrokenPipeError)",
+                    request_id=request_id,
+                )
         except Exception as e:
             _terminal_status("❌", f"Request {request_id} failed: {e}", indent=1)
             if request_logger:
@@ -2411,16 +3061,26 @@ class APIHandler(BaseHTTPRequestHandler):
                 elapsed = max(end_at - generation_started_at, 1e-9)
                 output_tokens = len(generated_tokens)
                 speed = output_tokens / elapsed if output_tokens else 0.0
-                
-                non_reasoning_tokens = len(_tokenize_prompt(message_text)) if message_text else 0
+
+                non_reasoning_tokens = (
+                    len(_tokenize_prompt(message_text)) if message_text else 0
+                )
                 reasoning_tokens = max(0, output_tokens - non_reasoning_tokens)
-                token_breakdown = f"{output_tokens} (reasoning: {reasoning_tokens}, output: {non_reasoning_tokens})" if enable_thinking else f"{output_tokens}"
+                token_breakdown = (
+                    f"{output_tokens} (reasoning: {reasoning_tokens}, output: {non_reasoning_tokens})"
+                    if enable_thinking
+                    else f"{output_tokens}"
+                )
 
                 if first_token_at is not None:
                     prefill_seconds = first_token_at - generation_started_at
                     decode_seconds = max(end_at - first_token_at, 1e-9)
-                    decode_tps = output_tokens / decode_seconds if output_tokens else 0.0
-                    prefill_tps = rest_count / prefill_seconds if prefill_seconds > 0 else 0.0
+                    decode_tps = (
+                        output_tokens / decode_seconds if output_tokens else 0.0
+                    )
+                    prefill_tps = (
+                        rest_count / prefill_seconds if prefill_seconds > 0 else 0.0
+                    )
                     _terminal_status(
                         "✅",
                         (
@@ -2446,6 +3106,7 @@ class APIHandler(BaseHTTPRequestHandler):
             if acquired:
                 model_lock.release()
 
+
 def run():
     start_litellm_proxy()
     server_address = (SETTINGS.mlx_host, SETTINGS.mlx_port)
@@ -2463,5 +3124,6 @@ def run():
     except KeyboardInterrupt:
         pass
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     run()
