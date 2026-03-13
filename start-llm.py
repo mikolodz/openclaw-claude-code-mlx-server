@@ -1541,10 +1541,10 @@ def _vlm_prompt_and_inputs(
     tools: Optional[Any] = None,
     enable_thinking: Optional[bool] = None,
     **kwargs: Any,
-) -> Tuple[Any, Any, Any]:
+) -> Tuple[Any, Any, Any, Any]:
     """
     Build formatted prompt and run prepare_inputs for VLM using native chat templates.
-    Returns (input_ids, pixel_values, mask) where input_ids is mx.array; mask may be None.
+    Returns (input_ids, pixel_values, mask, vlm_kwargs) where input_ids is mx.array; mask may be None.
     """
     template_kwargs = dict(kwargs)
     if tools is not None:
@@ -1610,8 +1610,13 @@ def _vlm_prompt_and_inputs(
     input_ids = inputs.get("input_ids")
     pixel_values = inputs.get("pixel_values")
     mask = inputs.get("attention_mask")
+    vlm_kwargs = {
+        k: v
+        for k, v in inputs.items()
+        if k not in ["input_ids", "pixel_values", "attention_mask"]
+    }
 
-    return input_ids, pixel_values, mask
+    return input_ids, pixel_values, mask, vlm_kwargs
 
 
 def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
@@ -2357,6 +2362,7 @@ def _stream_generate_unified(
     prompt_cache,
     vlm_pixel_values=None,
     vlm_mask=None,
+    vlm_kwargs=None,
     cache_match_type="miss",
 ):
     """
@@ -2384,10 +2390,19 @@ def _stream_generate_unified(
             if rest_tokens
             else mx.array([[0]], dtype=mx.int32)
         )
+        
+        sliced_mask = None
+        if vlm_mask is not None:
+            if rest_tokens:
+                sliced_mask = vlm_mask[..., -len(rest_tokens):]
+            else:
+                sliced_mask = vlm_mask[..., -1:]
+
         kwargs = {
             "input_ids": rest_ids,
             "pixel_values": vlm_pixel_values if use_vision else None,
-            "mask": vlm_mask if use_vision else None,
+            "mask": sliced_mask if use_vision else None,
+            **(vlm_kwargs if vlm_kwargs else {}),
             "prompt_cache": prompt_cache,
             "max_tokens": max_tokens,
             "sampler": sampler,
@@ -2456,6 +2471,7 @@ class APIHandler(BaseHTTPRequestHandler):
         vlm_pixel_values = None
         vlm_mask = None
         vlm_input_ids_raw = None
+        vlm_kwargs = None
 
         if is_vlm:
             raw_messages = body.get("messages", [])
@@ -2466,7 +2482,7 @@ class APIHandler(BaseHTTPRequestHandler):
             images = _extract_images_from_messages(body.get("messages", []))
 
             with model_lock:
-                vlm_input_ids_raw, vlm_pixel_values, vlm_mask = _vlm_prompt_and_inputs(
+                vlm_input_ids_raw, vlm_pixel_values, vlm_mask, vlm_kwargs = _vlm_prompt_and_inputs(
                     processor,
                     vlm_config or {},
                     messages,
@@ -2757,6 +2773,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt_cache,
                     vlm_pixel_values=vlm_pixel_values,
                     vlm_mask=vlm_mask,
+                    vlm_kwargs=vlm_kwargs,
                     cache_match_type=cache_match_type,
                 ):
                     generated_parts.append(response.text)
@@ -2900,6 +2917,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt_cache,
                     vlm_pixel_values=vlm_pixel_values,
                     vlm_mask=vlm_mask,
+                    vlm_kwargs=vlm_kwargs,
                     cache_match_type=cache_match_type,
                 ):
                     generated_tokens.append(int(response.token))
