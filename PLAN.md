@@ -320,16 +320,20 @@ When it is time to execute sub-agent work, these are the scoped jobs:
 
 ### Known limitations and risks
 
-**L1 — Per-message token length (FIXED 2026-03-13):**
+**L1 — Per-message token length (FIXED 2026-03-13, revised 2026-03-13):**
 `_update_session_turn_store` now uses `_compute_msg_token_boundaries()` which renders each
 message prefix through `tokenizer.apply_chat_template(messages[:i+1], add_generation_prompt=False)`
-to get exact cumulative token counts. The last bucket is corrected to `len(prompt_tokens) -
-sum(prev)` to include the generation prompt overhead. This fix was required for the `insert`
-scenario: the old `"role: content"` approximation gave `stable_tok=303` for a ~237-token system
-message, causing the secondary lookup prefix to spill into the inserted user message (different
-between turns) and block-hash mismatch → miss. After fix: `stable_tok=237`, secondary lookup
-finds the correct boundary. Falls back to equal-division approximation for VLMs or if
-`apply_chat_template` fails.
+to get exact cumulative token counts. **Revised fix (2026-03-13):** The last bucket is now
+set to `prev_len - sum(prev[:-1])` where `prev_len` is the loop's final value — i.e. the
+length of `apply_chat_template(messages, add_generation_prompt=False)`. We deliberately do
+NOT use `len(prompt_tokens)` (rendered with `add_generation_prompt=True, enable_thinking=True`)
+because that includes the generation-prompt suffix `<|im_start|>assistant\n<think>\n\n` (Qwen3).
+Including those tokens in the last bucket caused `_stable_prefix_token_len` to sum past the
+end of the real messages into the generation-prompt region. On the next request the token at
+that position differed (`\n` ID 198 vs `\n\n` ID 271) because the model emits a different
+`<think>` opener each time — this was the root cause of every "CACHE DIVERGENCE DETECTED AT
+INDEX N" warning observed with Qwen3 + tool calls in OpenClaw. Falls back to equal-division
+approximation for VLMs or if `apply_chat_template` fails.
 
 **L2 — Secondary lookup only helps if the prior turn's cache is still alive:**
 `SESSION_TURN_STORE` knows the stable prefix length, but `PROMPT_CACHE.fetch_nearest_cache` can only return something if the prior turn's KV state was stored and not yet evicted by LRU. If the cache was evicted (e.g. many concurrent sessions, or the server restarted), the stable-prefix lookup returns nothing and we fall back to a full miss. This is correct behaviour — we never synthesise a cache entry that doesn't exist.
@@ -440,4 +444,4 @@ The stable-prefix diff uses `messages` (the structured list post-healing). For V
 
 ---
 
-*Last updated: 2026-03-13 (OpenClaw Round 1 invalidated — Qwen3.5 tool_calls not emitted; Round 2 blocked on model capability)*
+*Last updated: 2026-03-13 (L1 boundary bug fixed — generation-prompt tokens no longer bleed into last message bucket; root cause of Qwen3 + tool-call cache divergence resolved)*

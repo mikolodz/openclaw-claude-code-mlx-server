@@ -659,6 +659,15 @@ class LRUPromptCache:
 
         del self._entries[key]
 
+        # Return evicted Metal GPU buffers to the OS pool immediately.
+        # Without this, MLX holds the backing Metal buffers in its pool even
+        # after the Python reference is dropped, causing monotonic GPU memory
+        # growth during long sessions with repeated cache divergence.
+        try:
+            mx.metal.clear_cache()
+        except Exception:
+            pass
+
     def _extract(self, model, tokens):
         key = (model, tuple(tokens))
         entry = self._entries[key]
@@ -1228,12 +1237,23 @@ def _compute_msg_token_boundaries(
                     cur_len = prev_len
                 msg_token_lens.append(max(0, cur_len - prev_len))
                 prev_len = cur_len
-            # Correct the last bucket using the authoritative total (which includes
-            # the generation prompt tokens added at the end of the full render).
-            total = len(prompt_tokens)
+            # Correct the last bucket using prev_len, which after the loop holds the
+            # token count for the full message list rendered WITHOUT a generation
+            # prompt (last loop iteration called apply_chat_template(messages[:n], ...,
+            # add_generation_prompt=False)). We intentionally do NOT use
+            # len(prompt_tokens) here because prompt_tokens was rendered with
+            # add_generation_prompt=True (and enable_thinking=True for Qwen3), which
+            # appends tokens such as "<|im_start|>assistant\n<think>\n\n". If those
+            # tokens were absorbed into the last-message bucket,
+            # _stable_prefix_token_len would sum past the real message content into
+            # the generation-prompt region. On the next request the same position
+            # holds a different token depending on how the new response starts
+            # (e.g. <think>\n ID 198 vs <think>\n\n ID 271), causing the
+            # "cache divergence at <think>" bug with Qwen3 + tool calls.
+            # prev_len gives a boundary that stops exactly at the last real message.
             if msg_token_lens:
                 prefix_sum = sum(msg_token_lens[:-1])
-                msg_token_lens[-1] = max(0, total - prefix_sum)
+                msg_token_lens[-1] = max(0, prev_len - prefix_sum)
             return msg_token_lens
         except Exception:
             pass  # Fall through to approximation
@@ -1894,15 +1914,24 @@ def _insert_cache_entries(
     tool_calls: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """
-    Insert the standard full-turn cache entry and, for tool-call turns, also
-    insert a prompt-only checkpoint. The checkpoint helps next-turn prefix reuse
-    when provider-side tool-call serialization differs between turns.
+    Insert the standard full-turn cache entry and, for tool-call or VLM turns,
+    also insert a prompt-only checkpoint. The checkpoint helps next-turn prefix
+    reuse when provider-side tool-call serialisation differs between turns, or
+    when VLM vision tokens change the effective prompt boundary.
+
+    For plain LM turns without tool calls the full-key entry alone is sufficient:
+    the next request will get a 'shorter' hit via _cull_redundant_prefixes or
+    trim, without requiring a second deepcopy here. Gating the deepcopy prevents
+    two full KV tensors (~2–3 GB each at 20k tokens) from living simultaneously
+    in GPU memory on every non-tool turn.
     """
-    # Always insert a prompt-only checkpoint when possible so the next turn can
-    # match this prefix (cache=shorter). Required for VLM prefix reuse when the
-    # session only has the full key (prompt+generated); also helps LM.
+    # Only insert a prompt-only checkpoint for turns where it actually helps:
+    # - tool_calls: next turn's prompt differs from cache key due to serialisation
+    # - is_vlm: VLM requests need an explicit prefix entry for vision-token reuse
+    # Plain LM turns get 'shorter' cache hits from the full-key entry alone.
     if (
-        generated_tokens
+        (tool_calls or is_vlm)
+        and generated_tokens
         and can_trim_prompt_cache(prompt_cache)
         and len(cache_key) > len(generated_tokens)
     ):
@@ -2390,11 +2419,11 @@ def _stream_generate_unified(
             if rest_tokens
             else mx.array([[0]], dtype=mx.int32)
         )
-        
+
         sliced_mask = None
         if vlm_mask is not None:
             if rest_tokens:
-                sliced_mask = vlm_mask[..., -len(rest_tokens):]
+                sliced_mask = vlm_mask[..., -len(rest_tokens) :]
             else:
                 sliced_mask = vlm_mask[..., -1:]
 
@@ -2482,13 +2511,15 @@ class APIHandler(BaseHTTPRequestHandler):
             images = _extract_images_from_messages(body.get("messages", []))
 
             with model_lock:
-                vlm_input_ids_raw, vlm_pixel_values, vlm_mask, vlm_kwargs = _vlm_prompt_and_inputs(
-                    processor,
-                    vlm_config or {},
-                    messages,
-                    images,
-                    tools=tools,
-                    enable_thinking=enable_thinking,
+                vlm_input_ids_raw, vlm_pixel_values, vlm_mask, vlm_kwargs = (
+                    _vlm_prompt_and_inputs(
+                        processor,
+                        vlm_config or {},
+                        messages,
+                        images,
+                        tools=tools,
+                        enable_thinking=enable_thinking,
+                    )
                 )
                 _vlm_sync_before_generation(vlm_pixel_values, vlm_mask)
 
