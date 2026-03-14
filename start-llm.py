@@ -402,7 +402,8 @@ INBOUND_META_MESSAGE_ID_PATTERN = re.compile(r'("message_id"\s*:\s*")[^"]+(")')
 INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN = re.compile(
     r"## Group Chat Context\s*\n"
     r"## Inbound Context \(trusted metadata\)\s*\n"
-    r".*?```json\s*\n.*?\n```\s*\n?",
+    r"(?:(?!## |# Project Context)[^\n]*\n){0,10}"  # allow up to 10 desc lines before ```json
+    r"```json\s*\n.*?\n```\s*\n?",
     re.DOTALL,
 )
 CACHE_STABLE_INBOUND_CONTEXT_BLOCK = (

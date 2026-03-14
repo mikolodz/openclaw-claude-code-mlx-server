@@ -499,5 +499,235 @@ observable.
 
 ---
 
-*Last updated: 2026-03-14 (Phase 4: OOM prevention — Metal GC on eviction, max entries 64→16,
-prompt-only deepcopy gated to tool/VLM turns, longest-candidate selection in fetch_nearest_cache)*
+---
+
+## Phase 5 — Critical Bug: Context Lobotomy via Normalization Regex (2026-03-14)
+
+### Root cause
+
+`INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN` was defined as:
+
+```python
+re.compile(
+    r"## Group Chat Context\s*\n"
+    r"## Inbound Context \(trusted metadata\)\s*\n"
+    r".*?```json\s*\n.*?\n```\s*\n?",
+    re.DOTALL,
+)
+```
+
+The `.*?` before ` ```json ` was intended to skip over any text between the section header
+and the JSON code block. When OpenClaw sends the block already pre-normalized
+(`__CACHE_STABLE_INBOUND_CONTEXT__` in place of the real JSON), there is no immediate
+` ```json ` to match — so `.*?` (with `re.DOTALL`) scans forward across the entire
+`# Project Context` section and terminates at the **first ` ```json ``` ` found inside
+AGENTS.md or TOOLS.md** (char 16,227 → 34,062: 17,835 chars deleted).
+
+Result: AGENTS.md, SOUL.md, TOOLS.md, USER.md, HEARTBEAT.md, MEMORY.md were silently
+stripped from the prompt before tokenization. The model received a 25,731-char prompt
+instead of the correct 43,473-char prompt. The agent was blind to its entire identity,
+team roster, and operational protocol.
+
+Evidence: `logs/2026-03-14/cache-session-bd7087f6ef7a0c43.log` — system message 43,473
+chars in `messages[]`, but rendered prompt fed to model was lobotomized.
+
+### Fix (applied 2026-03-14)
+
+Removed the `.*?` lookahead — pattern now requires the ` ```json ` block to appear
+**immediately** after the section header (no intervening content):
+
+```python
+re.compile(
+    r"## Group Chat Context\s*\n"
+    r"## Inbound Context \(trusted metadata\)\s*\n"
+    r"```json\s*\n.*?\n```\s*\n?",
+    re.DOTALL,
+)
+```
+
+When the block is already stable (`__CACHE_STABLE_INBOUND_CONTEXT__` present), the
+pattern correctly produces no match and the document is left intact.
+
+### Phase 5 follow-up bug (discovered 2026-03-14, fixed same day)
+
+The Phase 5 fix was **too strict**: OpenClaw's real format has 3–4 lines of description
+text between `## Inbound Context (trusted metadata)` and the ` ```json ` code fence.
+The strict pattern produced **0 matches** on every real OpenClaw request.
+
+As a result, the `elif "# Project Context"` fallback fired on every request, prepending
+a synthetic `## Group Chat Context / ## Inbound Context / __CACHE_STABLE_INBOUND_CONTEXT__`
+block immediately before `# Project Context`. This left the original real-JSON Inbound
+Context block untouched AND added a duplicate stable-token block — two Inbound Context
+blocks in the model's context on every turn.
+
+**Fix**: relaxed the pattern to allow up to 10 description lines between the header and
+the ` ```json ` fence, anchored by negative lookahead so it cannot cross `## ` or
+`# Project Context` boundaries:
+
+```python
+re.compile(
+    r"## Group Chat Context\s*\n"
+    r"## Inbound Context \(trusted metadata\)\s*\n"
+    r"(?:(?!## |# Project Context)[^\n]*\n){0,10}"
+    r"```json\s*\n.*?\n```\s*\n?",
+    re.DOTALL,
+)
+```
+
+Verified against real log (`logs/2026-03-14/cache-session-bd7087f6ef7a0c43.log`):
+- Pre-fix: 2 Inbound Context blocks in normalized output, 44,054 chars
+- Post-fix: 1 Inbound Context block, 43,473 chars (correct, matches Phase 5 evidence)
+
+---
+
+## Phase 6 — Dual-Pipeline Normalization Architecture (ACTIVE)
+
+> **Status: active — start here.**
+>
+> Root cause of every normalization bug in this project: the cache-key computation
+> and the model input are the same string, mutated in-place. Any normalization step
+> that is correct in 99% of inputs can be catastrophic in the 1% where it
+> over-matches. The fix is architectural: **split into two separate pipelines at the
+> message-struct level, before rendering.** This is the SOTA pattern used by vLLM,
+> SGLang, and Anthropic's own prompt-caching spec.
+
+### Architectural decision (settled — do not re-litigate)
+
+The Phase 5 lobotomy bug and the Phase 5 follow-up duplicate-block bug are both
+symptoms of the same root cause: `_normalize_prompt_for_cache()` mutates the rendered
+prompt string in-place, and `re.DOTALL` patterns on a flat string can silently consume
+user-controlled content. No amount of careful regex tuning permanently fixes this —
+every new client format or content variation is a new opportunity for over-matching.
+
+**The correct architecture is the dual pipeline** (see AGENTS.md North Star):
+
+```
+[1] _canonicalize_messages(messages)   ← structured data, before rendering
+      returns (original_messages, canonical_messages)
+
+[2] apply_chat_template(canonical_messages)  → cache_key_tokens  (lookup only)
+
+[3] apply_chat_template(original_messages)   → model_input_tokens (prefill + generate)
+
+[4] Post-render scrub on cache_key_tokens ONLY
+      ← atomic, line-scoped patterns (cch=, billing header, request IDs)
+      ← NO re.DOTALL on the full rendered string, ever
+```
+
+The model always receives `original_messages` rendered intact. The cache key uses
+`canonical_messages`. The two pipelines diverge at step [1] and never recombine.
+
+### Current state defects (to be eliminated)
+
+| Defect | Location | Impact |
+|--------|----------|--------|
+| In-place mutation of rendered prompt | `_normalize_prompt_for_cache()` called on rendered string | Phase 5 lobotomy, Phase 5 follow-up duplicate block |
+| Double normalization on VLM path | `_prepare_messages_for_vlm` L1534 + `_vlm_prompt_and_inputs` L1628 | Second pass sees synthetic tokens from first pass; mismatch risk |
+| Model input == cache key | `cache_prompt = _normalize_prompt_for_cache(prompt)` L2561 | Normalization errors affect what the model sees, not just the cache key |
+| No safety invariant | None | Silent deletions go undetected until agent reports blindness |
+| `elif "# Project Context"` fallback | `_normalize_prompt_for_cache()` L1978 | Fires when pattern doesn't match, prepends synthetic block; caused duplicate-block bug |
+
+### Work steps
+
+#### Step 1 — Introduce `_canonicalize_messages()` (message-struct level)
+
+- [ ] **Write `_canonicalize_messages(messages)`** — takes the raw healed message list,
+      returns `(original_messages, canonical_messages)`. Both are deep copies; original
+      is never modified. Canonical copy has volatile fields replaced with stable tokens:
+      - `message_id` values in JSON content → `__STABLE_MSG_ID__`
+      - Inbound metadata JSON blocks (OpenClaw `## Inbound Context`) → `__STABLE_INBOUND_META__`
+      - Any other per-message volatile field identified from real logs
+      The replacement must happen by **parsing the structured content**, not by regex on
+      the rendered string. For the Inbound Context block: locate it in the system message
+      `content` string by finding the structural anchor (`## Group Chat Context\n##
+      Inbound Context (trusted metadata)\n`), then replace only the JSON payload that
+      follows — not anything beyond the closing ` ``` ` fence.
+- [ ] **Classify every existing pattern in `_normalize_prompt_for_cache()`** — for each:
+      - Can it be moved to `_canonicalize_messages()` (message-level, pre-render)?
+      - If not, is it truly atomic and line-scoped (safe for post-render key-only scrub)?
+      - If neither: document why and what structural guarantee prevents over-matching.
+      Patterns that cannot satisfy either condition must be removed.
+
+#### Step 2 — Wire dual pipeline into `do_POST`
+
+- [ ] **LM path** (non-VLM, line ~2545):
+      Replace:
+      ```python
+      messages = _prepare_messages_for_template(healed_messages)
+      prompt = tokenizer.apply_chat_template(messages, ...)
+      cache_prompt = _normalize_prompt_for_cache(prompt)
+      prompt_tokens = _tokenize_prompt(cache_prompt)
+      ```
+      With:
+      ```python
+      original_messages, canonical_messages = _canonicalize_messages(healed_messages)
+      messages = _prepare_messages_for_template(original_messages)   # model input
+      cache_messages = _prepare_messages_for_template(canonical_messages)  # cache key
+      prompt = tokenizer.apply_chat_template(messages, ...)          # model sees this
+      cache_prompt = tokenizer.apply_chat_template(cache_messages, ...)
+      cache_prompt = _scrub_cache_key(cache_prompt)                  # atomic post-render scrub
+      prompt_tokens = _tokenize_prompt(cache_prompt)                 # cache lookup key
+      ```
+      `SESSION_TURN_STORE` diffs use `messages` (original) — the stable-prefix layer
+      already operates correctly on original messages.
+
+- [ ] **VLM path** (line ~2513): same split. Remove `_normalize_prompt_for_cache` call
+      from `_prepare_messages_for_vlm` (L1534) and from `_vlm_prompt_and_inputs` (L1628).
+      VLM cache key uses canonical messages through the VLM processor; model input uses
+      original messages.
+
+- [ ] **Rename / replace `_normalize_prompt_for_cache()`**:
+      - Rename to `_scrub_cache_key(text)` — makes its role explicit (cache key only,
+        never model input).
+      - Remove the `INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN` substitution and the
+        `elif "# Project Context"` fallback entirely — these are now handled at the
+        message-struct level in `_canonicalize_messages()`.
+      - Keep only atomic, line-scoped patterns: `CACHE_CCH_PATTERN`,
+        `CACHE_BILLING_HEADER_PATTERN`, `CACHE_TIME_PATTERN`,
+        `CACHE_SYSTEM_REMINDER_PATTERN`. All are single-line or structurally bounded.
+
+#### Step 3 — Safety invariant
+
+- [ ] **Add `_assert_cache_key_safety(original_prompt, cache_key_prompt)`** — callable
+      when `CACHE_NORM_SAFETY_CHECK=true` (env var, off by default). Asserts:
+      - `len(cache_key_prompt) >= len(original_prompt) * 0.90` — normalization must not
+        delete more than 10% of prompt characters. If violated: log an error, fall back
+        to using `original_prompt` as the cache key (safe degradation), never crash.
+
+#### Step 4 — Eliminate double normalization
+
+- [ ] **Confirm and remove** the `_normalize_prompt_for_cache(formatted)` call in
+      `_vlm_prompt_and_inputs` (line ~1628). After the dual-pipeline refactor, this
+      call is redundant (canonical messages were already processed at step [1]).
+- [ ] **Confirm and remove** the `_normalize_prompt_for_cache(text)` calls inside
+      `_prepare_messages_for_vlm` (lines ~1534, ~1541). Same reason.
+
+#### Step 5 — Regression validation
+
+- [ ] **Regression test against Phase 5 log** — run the raw system message from
+      `logs/2026-03-14/cache-session-bd7087f6ef7a0c43.log` through `_canonicalize_messages()`.
+      Assert: all 8 workspace files (AGENTS.md, SOUL.md, TOOLS.md, etc.) survive intact
+      in `original_messages`. Assert: canonical form has exactly 1 `__STABLE_INBOUND_META__`
+      token in place of the JSON payload.
+- [ ] **Probe session validation** — run `scripts/probe_session.py` all scenarios.
+      Cache hit rates must be unchanged or improved vs Phase 3 baseline.
+- [ ] **Log the dual-pipeline split** in per-request telemetry: add
+      `cache_key_normalized: bool` and `cache_key_delta_chars: int` fields to the
+      prompt log so future sessions can confirm the invariant is holding.
+
+---
+
+### What this phase does NOT change
+
+- `SESSION_TURN_STORE` / stable-prefix layer (Phase 2): operates on `original_messages`,
+  unaffected.
+- Block-based hash chain (`LRUPromptCache`): operates on `prompt_tokens` (cache key),
+  unaffected — it will now receive canonicalized tokens instead of normalized-rendered
+  tokens, which is strictly better for cache stability.
+- Longest-candidate selection (Phase 4 Fix 4): unaffected.
+- Tool-call checkpoint gating (Phase 4 Fix 3): unaffected.
+
+---
+
+*Last updated: 2026-03-14 (Phase 6 rewritten: dual-pipeline architecture — architectural
+decision settled, concrete implementation steps, no more research loop)*
