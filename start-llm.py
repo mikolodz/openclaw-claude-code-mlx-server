@@ -757,17 +757,25 @@ class LRUPromptCache:
         best_prefix_len = 0
         best_cached_tokens = None
 
-        # 2. Walk blocks backwards. Keep this intentionally simple/fast:
-        # first matching candidate wins for the longest matched block.
+        # 2. Walk blocks backwards. For each block level, collect ALL candidates
+        # that match up to that block boundary and pick the LONGEST one.
+        # Previously "first matching candidate wins" — but sets are unordered, so
+        # a short heartbeat/branch entry could win over a long conversation entry
+        # that shares the same early block hashes, causing a near-total cache flush.
         for chain_hash, req_prefix_len in reversed(chain_pairs):
             idx_key = (model, chain_hash)
             if idx_key in self._block_index:
                 candidate_tokens_set = self._block_index[idx_key]
+                best_candidate_at_level = None
+                best_candidate_len = -1
                 for candidate_tokens in candidate_tokens_set:
                     if tokens_tup[:req_prefix_len] == candidate_tokens[:req_prefix_len]:
-                        best_prefix_len = req_prefix_len
-                        best_cached_tokens = candidate_tokens
-                        break
+                        if len(candidate_tokens) > best_candidate_len:
+                            best_candidate_len = len(candidate_tokens)
+                            best_candidate_at_level = candidate_tokens
+                if best_candidate_at_level is not None:
+                    best_prefix_len = req_prefix_len
+                    best_cached_tokens = best_candidate_at_level
             if best_cached_tokens is not None:
                 break
 
@@ -2672,10 +2680,21 @@ class APIHandler(BaseHTTPRequestHandler):
                         cache_selection_source = "stable_prefix"
 
             # --- DEBUG BLOCK ---
+            # Only fire when the cache divergence is genuinely unexpected:
+            # - On a full miss (no cache entry found at all), or
+            # - On a 'shorter' hit where the matched prefix is significantly
+            #   less than what the stable-prefix layer expected to be cached.
+            #   A 'shorter' hit at the normal end-of-last-turn boundary is
+            #   expected behaviour and should not generate noise.
+            _debug_unexpected_miss = cache_match_type == "miss" or (
+                cache_match_type in ("shorter",)
+                and stable_prefix_token_len_computed > 0
+                and matched_prefix_len < stable_prefix_token_len_computed - 64
+            )
             if (
                 SETTINGS.vlm_cache_debug
                 and cache_session_tokens
-                and cache_match_type in ("shorter", "miss")
+                and _debug_unexpected_miss
             ):
                 # Compare the prompt against the actual candidate the global cache evaluated
                 _debug_token_divergence(

@@ -248,6 +248,42 @@ Evaluate each candidate design against the failure taxonomy from Phase 0:
 
 ---
 
+## Phase 4 — OOM Prevention & Cache Correctness (2026-03-14)
+
+> Motivated by real-session OOM crash (Metal kIOGPUCommandBufferCallbackErrorOutOfMemory)
+> during a 20k+ token OpenClaw session with repeated cache divergence.
+
+### Root causes identified
+
+| # | Problem | Location | Status |
+|---|---------|----------|--------|
+| 1 | `_delete` never called `mx.metal.clear_cache()` — evicted KV tensors lingered in Metal pool, causing monotonic GPU memory growth | `LRUPromptCache._delete` line ~660 | **Fixed** |
+| 2 | `PROMPT_CACHE_MAX_ENTRIES_GLOBAL=64` in `.env` — at 20k tokens × 2.6 GB/entry = 167 GB theoretical max, far exceeding 64 GB RAM | `.env` | **Fixed → 16** |
+| 3 | `_insert_cache_entries` unconditionally `copy.deepcopy`-ed the full KV tensor on **every** turn to create a prompt-only checkpoint — doubled GPU pressure on non-tool turns | `_insert_cache_entries` line ~1921 | **Fixed — gated to `tool_calls or is_vlm` only** |
+| 4 | `fetch_nearest_cache` iterated a Python `set` of candidates and took the **first match regardless of length** — when a short heartbeat/branch entry and the long conversation entry shared the same block hash bucket, the short one could win, causing a near-total cache flush (2.6% hit instead of 93%) | `LRUPromptCache.fetch_nearest_cache` block-walk loop | **Fixed — now picks longest candidate at each block level** |
+
+### Fix 4 detail — longest-candidate selection in `fetch_nearest_cache`
+
+The block hash index maps `(model, chain_hash) → set[token_tuple]`. Multiple entries can share
+the same chain hash for early blocks if their token prefixes are identical (e.g. a 10k-token
+heartbeat session and a 34k-token conversation with the same system prompt). The old code broke
+out of the inner loop on the first matching candidate — set iteration order is arbitrary in
+CPython, so the heartbeat entry could be returned instead of the conversation entry.
+
+Fix: scan all candidates at each block level and keep the one with the most tokens. Longest
+entry = most cached context = always the right choice when multiple entries are valid prefixes.
+
+### Debug noise reduction
+
+The `_debug_token_divergence` block (controlled by `VLM_CACHE_DEBUG=true`) previously fired on
+every `shorter` cache hit, which is the normal state for every turn in a long session (stored
+entry ends at previous turn boundary, new prompt is longer). This generated alarming
+`🚨 CACHE DIVERGENCE` output on every request. Fixed to only fire when the divergence is
+genuinely unexpected: full miss, or matched prefix more than 64 tokens shorter than the
+stable-prefix estimate.
+
+---
+
 ## Constraints & Non-Goals
 
 | Rule | Detail |
@@ -444,4 +480,24 @@ The stable-prefix diff uses `messages` (the structured list post-healing). For V
 
 ---
 
-*Last updated: 2026-03-13 (L1 boundary bug fixed — generation-prompt tokens no longer bleed into last message bucket; root cause of Qwen3 + tool-call cache divergence resolved)*
+### Known limitations added in Phase 4
+
+**L7 — Heartbeat / side-session collision (mitigated, not fully eliminated):**
+When a heartbeat or background agent uses the same implicit session ID as the main conversation
+(because the first 128 tokens of both prompts are identical), both entries coexist in the global
+cache. After Phase 4 Fix 4, the longest entry always wins in `fetch_nearest_cache`, so the main
+conversation's deep cache is no longer displaced by the heartbeat's shallow one. However, the
+heartbeat entry still occupies a cache slot and will be returned if the main conversation entry
+is evicted. Long-term fix: per-session cache partitioning (already scaffolded in `SessionIndex`
+but not yet activated for lookup). Do not activate without real-session evidence it helps.
+
+**L8 — `mx.metal.clear_cache()` called on every `_delete` (including `_cull_redundant_prefixes`):**
+Flushing the Metal pool on every single deletion adds a small synchronisation cost. In practice,
+`_cull_redundant_prefixes` runs on every insert and may call `_delete` 0–2 times. The cost is
+negligible compared to the KV prefill savings, but worth revisiting if insert latency becomes
+observable.
+
+---
+
+*Last updated: 2026-03-14 (Phase 4: OOM prevention — Metal GC on eviction, max entries 64→16,
+prompt-only deepcopy gated to tool/VLM turns, longest-candidate selection in fetch_nearest_cache)*
