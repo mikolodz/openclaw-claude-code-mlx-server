@@ -13,3 +13,9 @@ mlx_env/
 # Runtime artifacts
 logs/
 *.log
+
+AGENTS.md
+DDR.md
+GEMINI.md
+OC_CLAW_TEST.md
+OC_TEST.md

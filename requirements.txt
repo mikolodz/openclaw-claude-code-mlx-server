@@ -1,4 +1,9 @@
 mlx
 mlx-lm
+# Optional: for VLM models (e.g. Qwen2.5-VL, Qwen3.5-35B). Some models need: pip install mlx-vlm[torch]
+mlx-vlm
+# Support for torch models
+mlx-vlm[torch]
+# Support OpenAI compatible clients
 litellm[proxy]
 python-dotenv
