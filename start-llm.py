@@ -180,6 +180,7 @@ class Settings:
     cache_session_partitioning: bool
     prompt_cache_block_size: int
     cache_use_block_index: bool
+    cache_norm_safety_check: bool
     log_root: Path
     proxy_startup_wait_seconds: float
     proxy_model_id: str
@@ -262,6 +263,7 @@ def _build_settings() -> Settings:
             ["CACHE_USE_BLOCK_INDEX"],
             True,
         ),
+        cache_norm_safety_check=_env_bool("CACHE_NORM_SAFETY_CHECK", False),
         log_root=Path(_env_str("LOG_ROOT", str(SCRIPT_DIR / "logs"))),
         proxy_startup_wait_seconds=_env_float("PROXY_STARTUP_WAIT_SECONDS", 2.0),
         proxy_model_id=proxy_model_id,
@@ -399,21 +401,11 @@ QWEN_PARAMETER_PATTERN = re.compile(
     r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", re.DOTALL | re.IGNORECASE
 )
 INBOUND_META_MESSAGE_ID_PATTERN = re.compile(r'("message_id"\s*:\s*")[^"]+(")')
-INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN = re.compile(
-    r"## Group Chat Context\s*\n"
-    r"## Inbound Context \(trusted metadata\)\s*\n"
-    r"(?:(?!## |# Project Context)[^\n]*\n){0,10}"  # allow up to 10 desc lines before ```json
-    r"```json\s*\n.*?\n```\s*\n?",
-    re.DOTALL,
-)
-CACHE_STABLE_INBOUND_CONTEXT_BLOCK = (
-    "## Group Chat Context\n"
-    "## Inbound Context (trusted metadata)\n"
-    "__CACHE_STABLE_INBOUND_CONTEXT__\n"
-)
-INBOUND_CONTEXT_TO_PROJECT_BOUNDARY_PATTERN = re.compile(
-    r"(__CACHE_STABLE_INBOUND_CONTEXT__)\n+# Project Context"
-)
+# NOTE: INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN, CACHE_STABLE_INBOUND_CONTEXT_BLOCK, and
+# INBOUND_CONTEXT_TO_PROJECT_BOUNDARY_PATTERN were removed (Phase 7 Fix 2, 2026-03-14).
+# The Inbound Context block is now handled structurally by _canonicalize_inbound_context_block()
+# using plain string anchors with no DOTALL regex.  Do NOT re-add a DOTALL regex here —
+# see Phase 5 in PLAN.md for why that approach caused a 17k-char lobotomy bug.
 # Cache normalization: scrub volatile request-specific text so retries hit cache.
 CACHE_TIME_PATTERN = re.compile(r"Current time is[^\n]+\.", re.IGNORECASE)
 CACHE_CCH_PATTERN = re.compile(r"cch=[a-zA-Z0-9]+;?", re.IGNORECASE)
@@ -1090,9 +1082,9 @@ def _normalize_message_content_for_diff(msg: Dict[str, Any]) -> str:
 
     M4 IMPLEMENTATION NOTE: When real session logs from OpenCode/OpenClaw are
     audited, add confirmed volatile-field stripping here (timestamps, system-reminder
-    injections, etc.). The existing _normalize_prompt_for_cache() patterns are a
-    starting point but are applied at the serialised-string level — they need to be
-    adapted here at the per-message level after real-traffic confirmation.
+    injections, etc.). The post-render _scrub_cache_key() patterns are a reference
+    but are applied at the serialised-string level — they need to be adapted here at
+    the per-message level after real-traffic confirmation.
     """
     content = msg.get("content", "")
     if isinstance(content, str):
@@ -1531,17 +1523,15 @@ def _prepare_messages_for_vlm(
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     text = part.get("text") or part.get("content") or ""
-                    if SETTINGS.cache_canonicalize_tool_context:
-                        text = _normalize_prompt_for_cache(text)
+                    # NOTE: do NOT normalize here — model must see original content.
+                    # Canonicalization for cache key happens via _canonicalize_messages()
+                    # before rendering, and only in the cache key pipeline.
                     new_content.append({**part, "text": text})
                 else:
                     new_content.append(part)
             m["content"] = new_content
         elif isinstance(content, str):
-            if SETTINGS.cache_canonicalize_tool_context:
-                m["content"] = _normalize_prompt_for_cache(content)
-            else:
-                m["content"] = content
+            m["content"] = content
         if m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list):
             fixed_tool_calls = []
             for tc in m["tool_calls"]:
@@ -1624,9 +1614,9 @@ def _vlm_prompt_and_inputs(
             out = out[0].get("content", "") if out else ""
         formatted = str(out) if out else ""
 
-    # Normalize for cache so retries / stream=false use same token sequence as stream=true
-    if formatted and SETTINGS.cache_canonicalize_tool_context:
-        formatted = _normalize_prompt_for_cache(formatted)
+    # NOTE: do NOT scrub the formatted string here — this is the model input.
+    # Post-render scrubbing for the cache key is applied in do_POST on the
+    # cache_prompt_raw string (canonical pipeline), never on the model input.
 
     inputs = vlm_prepare_inputs(
         processor_any,
@@ -1957,38 +1947,80 @@ def _insert_cache_entries(
     SESSION_INDEX.register_cache_key(session_ctx, cache_key)
 
 
-def _normalize_prompt_for_cache(prompt):
+def _kv_cache_offset(cache: Any) -> Optional[int]:
     """
-    Normalize volatile, non-semantic metadata that changes every request
-    (e.g., inbound message_id) to keep cache keys stable across turns.
+    Return the current KV offset (number of original tokens actually stored in the
+    KV cache) from the first cache layer after any trim_prompt_cache() call.
+
+    KVCache and QuantizedKVCache both expose a public `.offset` int attribute
+    (mlx_lm/models/cache.py).  `prompt_cache` is a list of per-layer caches.
+
+    Returns None if the cache is None, empty, or does not expose .offset.
+    Callers must fall back to the canonical `matched_prefix_len` in that case.
+    """
+    try:
+        layer = cache[0] if isinstance(cache, (list, tuple)) else cache
+        return int(layer.offset)
+    except (IndexError, TypeError, AttributeError):
+        return None
+
+
+def _assert_cache_key_safety(
+    original_prompt: str,
+    cache_key_prompt: str,
+    context: str = "",
+) -> bool:
+    """
+    Safety invariant check for the dual-pipeline architecture.
+    Asserts that the cache key is not dramatically shorter than the original prompt,
+    which would indicate over-matching normalization silently deleting content.
+
+    Only called when CACHE_NORM_SAFETY_CHECK=true (off by default — no latency impact).
+
+    Returns True if invariant holds.  On violation: logs an error and returns False.
+    The caller must fall back to using original_prompt as the cache key.
+    """
+    if not isinstance(original_prompt, str) or not isinstance(cache_key_prompt, str):
+        return True
+    orig_len = len(original_prompt)
+    if orig_len == 0:
+        return True
+    key_len = len(cache_key_prompt)
+    ratio = key_len / orig_len
+    if ratio < 0.90:
+        _terminal_status(
+            "❌",
+            f"[CACHE-SAFETY] cache_key is {ratio:.1%} of original prompt "
+            f"({key_len} vs {orig_len} chars) — normalization over-matched. "
+            f"Falling back to original prompt as cache key. context={context}",
+        )
+        return False
+    return True
+
+
+def _scrub_cache_key(prompt: str) -> str:
+    """
+    Post-render scrub of the CACHE KEY ONLY — never called on the model input.
+
+    Applies only atomic, line-scoped or structurally-bounded substitutions that
+    cannot span section boundaries.  Volatile-but-semantically-neutral tokens:
+    - "Current time is …"         → __CACHE_STABLE_TIME__
+    - cch=<hex>;                  → cch=STATIC_CACHE;
+    - -anthropic-billing-header:  → STATIC_CACHE value
+    - <system-reminder>…</system-reminder>  → __CACHE_STABLE_SYSTEM_REMINDER__
+
+    The Inbound Context block and message_id scrubbing are handled upstream by
+    _canonicalize_messages() (message-struct level, before rendering).
+
+    Returns the original string unchanged if cache_canonicalize_tool_context is off
+    or the input is not a string.
     """
     if not isinstance(prompt, str):
         return prompt
     if not SETTINGS.cache_canonicalize_tool_context:
         return prompt
-    normalized = INBOUND_META_MESSAGE_ID_PATTERN.sub(
-        r"\1__CACHE_STABLE_MESSAGE_ID__\2",
-        prompt,
-    )
-    if INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN.search(normalized):
-        normalized = INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN.sub(
-            CACHE_STABLE_INBOUND_CONTEXT_BLOCK,
-            normalized,
-            count=1,
-        )
-    elif "# Project Context" in normalized:
-        normalized = normalized.replace(
-            "# Project Context",
-            f"{CACHE_STABLE_INBOUND_CONTEXT_BLOCK}\n# Project Context",
-            1,
-        )
-    normalized = INBOUND_CONTEXT_TO_PROJECT_BOUNDARY_PATTERN.sub(
-        r"\1\n# Project Context",
-        normalized,
-        count=1,
-    )
-    # Scrub timestamp and Claude Code telemetry so retries don't break cache (e.g. at ~15k tokens).
-    normalized = CACHE_TIME_PATTERN.sub("__CACHE_STABLE_TIME__", normalized)
+    # Scrub timestamp and Claude Code telemetry so retries don't break cache.
+    normalized = CACHE_TIME_PATTERN.sub("__CACHE_STABLE_TIME__", prompt)
     normalized = CACHE_CCH_PATTERN.sub("cch=STATIC_CACHE;", normalized)
     normalized = CACHE_BILLING_HEADER_PATTERN.sub(
         "-anthropic-billing-header: STATIC_CACHE", normalized
@@ -1997,6 +2029,144 @@ def _normalize_prompt_for_cache(prompt):
         "__CACHE_STABLE_SYSTEM_REMINDER__", normalized
     )
     return normalized
+
+
+# _normalize_prompt_for_cache alias removed (Phase 7 Fix 4, 2026-03-14).
+# No call sites remain after Phase 6 cleanup.  Use _scrub_cache_key() directly.
+
+
+# --- DUAL-PIPELINE: message-struct level canonicalization ---
+# Structural anchors for the OpenClaw "Inbound Context (trusted metadata)" block.
+# These constants are intentionally plain strings — no regex — so there is no
+# risk of accidental over-matching on user content.
+_INBOUND_CONTEXT_HEADER = (
+    "## Group Chat Context\n## Inbound Context (trusted metadata)\n"
+)
+_INBOUND_CONTEXT_FENCE_OPEN = "```json"
+_INBOUND_CONTEXT_FENCE_CLOSE = "```"
+
+
+def _canonicalize_inbound_context_block(content: str) -> str:
+    """
+    Replace the JSON payload inside the OpenClaw "Inbound Context (trusted metadata)"
+    block with a stable token, operating purely on the string at the content level
+    (no regex, no DOTALL).  Returns the modified string if the block is found;
+    returns the original string unchanged if the block is absent or already stable.
+
+    Safety guarantee: we only touch the text between the opening ```json fence and
+    the immediately-following ``` closing fence inside the Inbound Context block.
+    We stop at the first ``` that follows — we never scan past a second code fence.
+    """
+    header_pos = content.find(_INBOUND_CONTEXT_HEADER)
+    if header_pos == -1:
+        return content
+
+    # Start searching for ```json after the header.
+    search_start = header_pos + len(_INBOUND_CONTEXT_HEADER)
+
+    # Allow up to 10 description lines before the opening fence.
+    # Uses plain string search (no regex, no DOTALL) — anchored at the header.
+    fence_open_pos = -1
+    cursor = search_start
+    for _ in range(10):
+        line_end = content.find("\n", cursor)
+        if line_end == -1:
+            break
+        line = content[cursor:line_end]
+        if line.startswith(_INBOUND_CONTEXT_FENCE_OPEN):
+            fence_open_pos = cursor
+            break
+        # Stop if we hit a new section header
+        if line.startswith("## ") or line.startswith("# "):
+            break
+        cursor = line_end + 1
+
+    if fence_open_pos == -1:
+        return content
+
+    # Already stable — no-op.
+    if "__STABLE_INBOUND_META__" in content[fence_open_pos : fence_open_pos + 200]:
+        return content
+
+    # Find the newline after ```json ... so we can locate the JSON body.
+    fence_line_end = content.find("\n", fence_open_pos)
+    if fence_line_end == -1:
+        return content
+    json_body_start = fence_line_end + 1
+
+    # Find the closing ``` fence.  It must be on its own line.
+    fence_close_pos = content.find("\n" + _INBOUND_CONTEXT_FENCE_CLOSE, json_body_start)
+    if fence_close_pos == -1:
+        return content
+    # fence_close_pos points to the '\n' before the closing ```.
+    # fence_close_pos + 1 is the first ` of the closing fence itself.
+    fence_close_start = fence_close_pos + 1
+
+    # Reconstruct: keep everything up to (and including) ```json\n,
+    # insert stable token, then the closing ``` fence and the rest.
+    # The closing fence is kept so the canonical form is well-formed markdown
+    # and _assert_cache_key_safety does not fire spuriously on large JSON blocks.
+    result = (
+        content[:json_body_start]
+        + "__STABLE_INBOUND_META__\n"
+        + content[fence_close_start:]
+    )
+    return result
+
+
+def _canonicalize_messages(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Pre-render canonicalization: returns (original_messages, canonical_messages).
+
+    - original_messages  : deep copy of the input, never modified.
+      This is what the model always receives (fed to apply_chat_template for generation).
+    - canonical_messages : deep copy with volatile-but-semantically-neutral fields
+      replaced by stable tokens.  Used ONLY for cache key computation.
+
+    Volatile fields normalised in the canonical copy (message-struct level only):
+    1. "message_id" values inside JSON content strings → __STABLE_MSG_ID__
+       (handles OpenClaw / Claude Code per-request IDs that change every turn)
+    2. OpenClaw "Inbound Context (trusted metadata)" JSON block → __STABLE_INBOUND_META__
+       (handled structurally via string anchors, no DOTALL regex)
+
+    No other mutations.  In particular, tool results and <think> blocks are
+    preserved verbatim — the model sees them intact.
+    """
+    if not SETTINGS.cache_canonicalize_tool_context:
+        # Canonicalization disabled: both pipelines see the same content.
+        original = copy.deepcopy(messages)
+        return original, copy.deepcopy(original)
+
+    original: List[Dict[str, Any]] = copy.deepcopy(messages)
+    canonical: List[Dict[str, Any]] = copy.deepcopy(messages)
+
+    for msg in canonical:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            # 1. Stable message IDs.
+            content = INBOUND_META_MESSAGE_ID_PATTERN.sub(
+                r"\1__STABLE_MSG_ID__\2", content
+            )
+            # 2. Inbound Context block.
+            content = _canonicalize_inbound_context_block(content)
+            msg["content"] = content
+        elif isinstance(content, list):
+            new_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text", "")
+                    text = INBOUND_META_MESSAGE_ID_PATTERN.sub(
+                        r"\1__STABLE_MSG_ID__\2", text
+                    )
+                    text = _canonicalize_inbound_context_block(text)
+                    new_parts.append({**part, "text": text})
+                else:
+                    new_parts.append(part)
+            msg["content"] = new_parts
+
+    return original, canonical
 
 
 def _extract_session_context(
@@ -2540,13 +2710,25 @@ class APIHandler(BaseHTTPRequestHandler):
             else:
                 prompt_tokens = []
 
+            # VLM: model_tokens == prompt_tokens (single pipeline — VLM processor
+            # works on original messages after Step 3 removes in-place normalization).
+            model_tokens = prompt_tokens
+
             prompt = ""
 
         else:
             raw_messages = body.get("messages", [])
             # --- APPLY STATELESS HEALING ---
             healed_messages = _heal_messages(raw_messages)
-            messages = _prepare_messages_for_template(healed_messages)
+
+            # --- DUAL PIPELINE: split model input from cache key at message-struct level ---
+            # original_messages → rendered → model sees this (never normalized)
+            # canonical_messages → rendered → scrubbed → cache lookup key only
+            original_messages, canonical_messages = _canonicalize_messages(
+                healed_messages
+            )
+            messages = _prepare_messages_for_template(original_messages)
+            cache_messages = _prepare_messages_for_template(canonical_messages)
 
             if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
                 prompt = tokenizer.apply_chat_template(
@@ -2556,24 +2738,50 @@ class APIHandler(BaseHTTPRequestHandler):
                     tools=tools,
                     enable_thinking=enable_thinking,
                 )
+                cache_prompt_raw = tokenizer.apply_chat_template(
+                    cache_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    enable_thinking=enable_thinking,
+                )
             else:
                 prompt = messages[-1]["content"] if messages else ""
+                cache_prompt_raw = (
+                    cache_messages[-1]["content"] if cache_messages else ""
+                )
 
-            cache_prompt = _normalize_prompt_for_cache(prompt)
+            # Post-render scrub: atomic, line-scoped patterns only (cch=, billing header,
+            # timestamps, system-reminder). Never applied to the model input.
+            cache_prompt = _scrub_cache_key(cache_prompt_raw)
+            # Safety invariant: cache key must not be dramatically shorter than the original.
+            if SETTINGS.cache_norm_safety_check:
+                if not _assert_cache_key_safety(
+                    prompt, cache_prompt, context="lm_path"
+                ):
+                    # Normalization over-matched — fall back to using the original prompt
+                    # as the cache key to prevent invisible content loss.
+                    cache_prompt = prompt
+            # Cache lookup uses canonical token sequence; model input uses original tokens.
             prompt_tokens = _tokenize_prompt(cache_prompt)
+            model_tokens = _tokenize_prompt(prompt)
             prompt_was_normalized = cache_prompt != prompt
+            cache_key_delta_chars = len(prompt) - len(cache_prompt)
 
         session_ctx = _extract_session_context(body, prompt_tokens)
         if is_vlm:
             prompt_was_normalized = bool(SETTINGS.cache_canonicalize_tool_context)
+            cache_key_delta_chars = 0
         cache_key = prompt_tokens[:]
         prompt_cache = None
-        rest_tokens = prompt_tokens
+        # model_tokens: tokens derived from the original (unmodified) prompt.
+        # The model always prefills from this sequence, never from the canonical cache key.
+        rest_tokens = model_tokens
         cache_session_tokens = prompt_tokens
         cache_match_type = "miss"
         matched_prefix_len = 0
         cache_selection_source = "none"
-        rest_count = len(prompt_tokens)
+        rest_count = len(model_tokens)
         request_logger = None
         sampler, sampler_kwargs = _build_sampler(body)
         max_tokens = body.get("max_tokens", SETTINGS.default_max_tokens)
@@ -2608,9 +2816,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     ) = _stable_prefix_token_len(_session_id_for_turn, messages)
 
                 # --- Standard global cache lookup ---
+                # Cache lookup operates on prompt_tokens (canonical key).
+                # rest_tokens will be overridden below to use model_tokens (original).
                 (
                     prompt_cache,
-                    rest_tokens,
+                    _rest_tokens_canonical,
                     cache_session_tokens,
                     cache_match_type,
                     matched_prefix_len,
@@ -2621,6 +2831,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     session_ctx=session_ctx,
                     prompt_cache_store=PROMPT_CACHE,
                 )
+                # Model always prefills from original tokens (dual-pipeline invariant).
+                # Use the actual KV cache offset (number of original tokens stored)
+                # rather than matched_prefix_len (which is a canonical token count and
+                # may differ when _canonicalize_messages() changes token lengths).
+                _kv_off = _kv_cache_offset(prompt_cache)
+                rest_tokens = model_tokens[
+                    _kv_off if _kv_off is not None else matched_prefix_len :
+                ]
 
                 # --- M3: Stable-prefix fallback ---
                 # If the global cache lookup found fewer cached tokens than the
@@ -2633,13 +2851,13 @@ class APIHandler(BaseHTTPRequestHandler):
                     and stable_prefix_token_len_computed < len(prompt_tokens)
                 ):
                     # Try to find a cache entry that covers at least stable_prefix_token_len_computed tokens.
-                    # We look up the stable prefix tokens directly.
+                    # We look up the stable prefix tokens directly (canonical key).
                     stable_prefix_toks = prompt_tokens[
                         :stable_prefix_token_len_computed
                     ]
                     (
                         sp_cache,
-                        sp_rest_tokens,
+                        _sp_rest_tokens_canonical,
                         sp_cache_session_tokens,
                         sp_match_type,
                         sp_matched_prefix_len,
@@ -2659,7 +2877,14 @@ class APIHandler(BaseHTTPRequestHandler):
                             )
                             if trim_amount > 0 and can_trim_prompt_cache(sp_cache):
                                 trim_prompt_cache(sp_cache, trim_amount)
-                            rest_tokens = prompt_tokens[sp_matched_prefix_len:]
+                            # Model prefills from original tokens starting at the actual
+                            # KV offset (not the canonical sp_matched_prefix_len).
+                            _sp_kv_off = _kv_cache_offset(sp_cache)
+                            rest_tokens = model_tokens[
+                                _sp_kv_off
+                                if _sp_kv_off is not None
+                                else sp_matched_prefix_len :
+                            ]
                         else:
                             # Full stable-prefix hit: re-prefill only the new suffix
                             # Trim the cache back to exactly stable_prefix_token_len_computed
@@ -2673,7 +2898,14 @@ class APIHandler(BaseHTTPRequestHandler):
                                 if can_trim_prompt_cache(sp_cache):
                                     trim_prompt_cache(sp_cache, trim_amount)
                                 sp_matched_prefix_len = stable_prefix_token_len_computed
-                            rest_tokens = prompt_tokens[sp_matched_prefix_len:]
+                            # Model prefills from original tokens starting at the actual
+                            # KV offset (not the canonical sp_matched_prefix_len).
+                            _sp_kv_off = _kv_cache_offset(sp_cache)
+                            rest_tokens = model_tokens[
+                                _sp_kv_off
+                                if _sp_kv_off is not None
+                                else sp_matched_prefix_len :
+                            ]
                         prompt_cache = sp_cache
                         cache_session_tokens = sp_cache_session_tokens
                         matched_prefix_len = sp_matched_prefix_len
@@ -2712,9 +2944,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 prompt_cache = make_prompt_cache(
                     cache_model, max_kv_size=SETTINGS.max_kv_size
                 )
-                rest_tokens = prompt_tokens
+                # Full miss: model prefills all original tokens (never canonical).
+                rest_tokens = model_tokens
             rest_count = (
-                len(rest_tokens) if rest_tokens is not None else len(prompt_tokens)
+                len(rest_tokens) if rest_tokens is not None else len(model_tokens)
             )
             cache_session_id = _cache_log_session_id(session_ctx, cache_session_tokens)
             if SETTINGS.enable_request_logging:
@@ -2748,6 +2981,8 @@ class APIHandler(BaseHTTPRequestHandler):
                             "cache_selection_source": cache_selection_source,
                             "matched_prefix_len": matched_prefix_len,
                             "cache_prompt_normalized": prompt_was_normalized,
+                            "cache_key_normalized": prompt_was_normalized,
+                            "cache_key_delta_chars": cache_key_delta_chars,
                             "prompt_tokens": len(prompt_tokens),
                             "session_id": session_ctx.session_id,
                             "parent_session_id": session_ctx.parent_session_id,
