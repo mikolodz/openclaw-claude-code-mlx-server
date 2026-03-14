@@ -915,3 +915,187 @@ _normalize_prompt_for_cache = _scrub_cache_key
 ---
 
 *Last updated: 2026-03-14 (Phase 7 complete: all 4 post-audit fixes applied and validated)*
+
+---
+
+## Phase 8 — Multi-Agent Sub-Session Cache Collapse (2026-03-14)
+
+> Motivated by a real OpenClaw multi-agent session (CEO → Spock → Dave sub-agent).
+> Spock's turn responding to CEO after Dave's completion hit 50.4% cache instead of
+> the expected ~98%.  Full reproduction confirmed via session log
+> `logs/2026-03-14/cache-session-bd7087f6ef7a0c43.log`.
+
+---
+
+### Session structure (confirmed from logs)
+
+| Turn | Request | Agent | Tokens | Cache | Notes |
+|------|---------|-------|--------|-------|-------|
+| T1 | 543f09faf0c5 | Spock | 15048 | 0% miss | System msg 44,059 chars |
+| T2 | 80ed00271c17 | Spock | 15421 | 97.6% hit | System msg 44,059 chars — identical to T1 |
+| T3 | 52942aa1f3f6 | Dave  | 11347 | 4% hit | Dave's system msg = 23,031 chars (different agent) |
+| T4 | a19d895800f1 | Dave  | 11438 | 99.2% hit | |
+| T5 | 2e23355df34a | Dave  | 11513 | 99.3% hit | |
+| T6 | ee9db5fa4f35 | Dave  | 11743 | 98.0% hit | |
+| T7 | 676071475689 | Spock | 15717 | **50.4% hit** | System msg **43,478 chars** — Inbound Context block absent |
+
+All 7 requests used session ID `implicit-4e3d4ed97bc36530` (same first 128 tokens:
+both Spock and Dave share the first ~455 tokens of the OpenClaw system preamble).
+
+---
+
+### Root cause 1 — System message differs between T2 and T7 (PRIMARY, confirmed)
+
+**Evidence**: T2 system message = 44,059 chars; T7 system message = 43,478 chars.
+Divergence at char 16,228 = token ~7,927 in VLM tokenization.
+
+**Cause**: The `## Group Chat Context / ## Inbound Context (trusted metadata)` block
+(581 chars, containing a static JSON payload `{"schema":"openclaw.inbound_meta.v1",...}`)
+is **present in T1 and T2** but **absent in T7**. OpenClaw dynamically includes or omits
+this block per turn (context-management or routing decision).
+
+The block is semantically stable — the JSON payload does not change. But its
+**presence or absence shifts every token after position 16,228**, breaking the block
+hash chain for all 7,534 tokens that follow.
+
+The cache matched correctly for the first 7,927 tokens (system preamble before the
+divergence point), then diverged. Result: 7,927 / 15,717 = 50.4% hit.
+
+**For the LM (non-VLM) path** this would also produce a miss, because
+`_canonicalize_inbound_context_block` only replaces the JSON body when the block IS
+present. When the block is absent it returns the content unchanged, so the canonical
+forms still differ at char 16,228.
+
+**Fix B** (applied below) makes `_canonicalize_inbound_context_block` produce
+**identical canonical output** regardless of whether the block is present or absent:
+both cases yield `__STABLE_INBOUND_CONTEXT_SECTION__\n# Project Context...`.
+
+---
+
+### Root cause 2 — VLM path lacks canonicalization (PRIMARY, structural)
+
+For VLM: `model_tokens = prompt_tokens` — no `_canonicalize_messages`, no
+`_scrub_cache_key`, no dual pipeline. Any change in system message content (even
+removing a static block) directly changes the cache key. This amplifies RC1.
+
+**Fix C** (applied below) adds a VLM canonical pipeline: `_canonicalize_messages` +
+`_scrub_cache_key` applied to the formatted VLM string via the processor's CPU
+tokenizer, producing a separate `prompt_tokens` (cache key) while `model_tokens`
+(model input) remains the raw VLM processor output.
+
+---
+
+### Root cause 3 — `PROMPT_CACHE_SESSION_MAX_IDLE_SECONDS=0` destroys SESSION_TURN_STORE (SECONDARY)
+
+`.env` has `PROMPT_CACHE_SESSION_MAX_IDLE_SECONDS=0`. In `_update_session_turn_store`
+the stale-check `(now - rec.touched_at) > 0` is **always True** for any record older
+than 0 ns. Every call prunes all records.
+
+Effect:
+1. Spock T2 record is written (correct).
+2. Dave T3's 75.97 s turn completes. At write time, Spock T2's record is pruned
+   (`now - T2.touched_at ≈ 76 s > 0`). Dave T3's 2-message record is written (no
+   write-guard because SESSION_TURN_STORE is empty after the prune).
+3. Dave T4→T6 continue replacing each other normally.
+4. Spock T7 arrives. SESSION_TURN_STORE has Dave T6's record.
+   `_stable_prefix_token_len` diffs Dave T6 vs Spock T7 → `stable_prefix_msg_count=0`.
+   M3 stable-prefix fallback is disabled for this turn.
+
+Even if M3 had been active, it could not have recovered the cache hit because the
+token content genuinely diverges (RC1). M3 uses the canonical `prompt_tokens` as its
+secondary lookup key; the canonical tokens also diverge at the RC1 boundary until
+Fix B+C are applied. After Fix B+C both Spock T2 and T7 canonical keys agree at the
+Inbound Context position, so the global lookup directly returns ~98% hit and M3 is not
+needed.
+
+**Fix A** (applied below) guards the stale prune with `if _SESSION_TURN_MAX_IDLE_SECONDS > 0`,
+treating 0 as "infinite TTL" (same convention as `LRUPromptCache._is_expired`).
+
+---
+
+### Root cause 4 — Sub-agent completion injection contains a volatile runtime field (MINOR)
+
+The OpenClaw sub-agent result injected as a user message in T7 includes:
+`Stats: runtime 1m52s • tokens 0 (in 0 / out 0)`. The runtime duration is volatile
+(changes each execution). UUIDs (`session_key`, `session_id`) are frozen per injection.
+
+**Fix D** (applied below) adds `SUBAGENT_STATS_PATTERN` to `_canonicalize_messages`,
+normalising `Stats: runtime X` → `Stats: runtime __STABLE_RUNTIME__`.
+
+---
+
+### Fixes applied (2026-03-14)
+
+#### Fix A — `PROMPT_CACHE_SESSION_MAX_IDLE_SECONDS=0` guard
+
+`_update_session_turn_store` stale-check now wrapped with
+`if _SESSION_TURN_MAX_IDLE_SECONDS > 0:` so a value of 0 means "never expire".
+
+- [x] Applied in `_update_session_turn_store` (Phase 8, 2026-03-14).
+
+#### Fix B — Canonical form for absent Inbound Context block
+
+`_canonicalize_inbound_context_block` now handles two cases:
+
+**Case A (block present)**: replaces the ENTIRE block (header + description lines +
+JSON fence) with `_INBOUND_CONTEXT_STABLE_SECTION = "__STABLE_INBOUND_CONTEXT_SECTION__"`.
+
+**Case B (block absent)**: if `\n# Project Context` anchor is present, inserts
+`\n__STABLE_INBOUND_CONTEXT_SECTION__` immediately before it.
+
+Both cases produce: `...\n__STABLE_INBOUND_CONTEXT_SECTION__\n# Project Context...`
+which is byte-identical. Cache block hashes agree from that position onwards.
+
+New constants: `_INBOUND_CONTEXT_STABLE_SECTION`, `_PROJECT_CONTEXT_ANCHOR`.
+
+- [x] Applied in `_canonicalize_inbound_context_block` (Phase 8, 2026-03-14).
+
+#### Fix C — VLM canonical pipeline
+
+VLM path in `do_POST` now computes `prompt_tokens` (cache key) separately from
+`model_tokens` (model input):
+
+1. `model_tokens` = VLM processor `input_ids` (original messages, unchanged).
+2. `prompt_tokens` = canonical form via:
+   - `_canonicalize_messages(healed_messages)` → `canonical_msgs_vlm`
+   - `_prepare_messages_for_vlm(canonical_msgs_vlm)`
+   - `processor.tokenizer.apply_chat_template(canon_prepared, tokenize=False, ...)`
+   - `_scrub_cache_key(formatted)` (timestamps, cch=, billing header, system-reminder)
+   - `processor.tokenizer.encode(scrubbed)` (CPU-only, no model_lock required)
+3. Falls back to `model_tokens` if processor tokenizer is unavailable.
+
+`cache_key_delta_chars` updated to reflect `len(model_tokens) - len(prompt_tokens)`.
+
+- [x] Applied in `do_POST` VLM branch (Phase 8, 2026-03-14).
+
+#### Fix D — Sub-agent completion stats canonicalization
+
+Added `SUBAGENT_STATS_PATTERN = re.compile(r"(Stats: runtime\s+)[^\n•]+", re.IGNORECASE)`.
+
+Applied in `_canonicalize_messages` canonical copy (step 3, after message-ID and
+Inbound Context normalisation). Normalises `Stats: runtime 1m52s → __STABLE_RUNTIME__`.
+
+- [x] Applied in `_canonicalize_messages` and `SUBAGENT_STATS_PATTERN` constant
+  (Phase 8, 2026-03-14).
+
+---
+
+### Open follow-up items
+
+- [ ] **Regression test Phase 8 fixes**: run `scripts/probe_session.py` all scenarios.
+      Confirm cache hit rates are at Phase 3 baseline or better.  Verify Fix B
+      idempotency: run `_canonicalize_inbound_context_block` on T2 system message
+      (block present) and T7 system message (block absent) and assert both produce
+      identical canonical output.
+- [ ] **VLM canonical pipeline validation**: start server with VLM model, run a
+      2-turn session, confirm `cache_key_delta_chars > 0` in log for turns where
+      the Inbound Context block is present, and `~98%` cache hit on turn 2.
+- [ ] **SESSION_TURN_STORE for VLM via canonical messages**: currently
+      `_stable_prefix_token_len` and `_update_session_turn_store` receive original
+      (non-canonical) messages for VLM. The diff comparison therefore sees the Inbound
+      Context block as volatile between turns, returning `stable_prefix_msg_count=0`.
+      This is acceptable (the global cache hit is fixed by C), but M3 secondary lookup
+      remains disabled for VLM sessions with system-message drift.  A future follow-up
+      should pass the canonical messages to `_update_session_turn_store` for VLM.
+
+*Last updated: 2026-03-14 (Phase 8: multi-agent sub-session cache collapse — 4 fixes applied)*

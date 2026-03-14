@@ -406,6 +406,11 @@ INBOUND_META_MESSAGE_ID_PATTERN = re.compile(r'("message_id"\s*:\s*")[^"]+(")')
 # The Inbound Context block is now handled structurally by _canonicalize_inbound_context_block()
 # using plain string anchors with no DOTALL regex.  Do NOT re-add a DOTALL regex here —
 # see Phase 5 in PLAN.md for why that approach caused a 17k-char lobotomy bug.
+# OpenClaw sub-agent completion event: "Stats: runtime 1m52s • tokens 0 (in 0 / out 0)"
+# The runtime duration is volatile (changes with each execution).  The UUIDs in
+# session_key and session_id are frozen per injection (stable across turns), so only
+# the runtime field needs to be normalised.  Single-line, structurally bounded — safe.
+SUBAGENT_STATS_PATTERN = re.compile(r"(Stats: runtime\s+)[^\n•]+", re.IGNORECASE)
 # Cache normalization: scrub volatile request-specific text so retries hit cache.
 CACHE_TIME_PATTERN = re.compile(r"Current time is[^\n]+\.", re.IGNORECASE)
 CACHE_CCH_PATTERN = re.compile(r"cch=[a-zA-Z0-9]+;?", re.IGNORECASE)
@@ -1283,15 +1288,20 @@ def _update_session_turn_store(
     if not session_id or not messages:
         return
 
-    # Prune stale entries
+    # Prune stale entries. A value of 0 means "never expire" (infinite TTL),
+    # consistent with LRUPromptCache._is_expired which returns False when
+    # ttl_seconds <= 0. Without this guard, _SESSION_TURN_MAX_IDLE_SECONDS=0
+    # makes (now - touched_at) > 0 always True, pruning every record on every
+    # write and silently destroying the stable-prefix mechanism for all sessions.
     now = time.time()
-    stale = [
-        sid
-        for sid, rec in SESSION_TURN_STORE.items()
-        if (now - rec.touched_at) > _SESSION_TURN_MAX_IDLE_SECONDS
-    ]
-    for sid in stale:
-        del SESSION_TURN_STORE[sid]
+    if _SESSION_TURN_MAX_IDLE_SECONDS > 0:
+        stale = [
+            sid
+            for sid, rec in SESSION_TURN_STORE.items()
+            if (now - rec.touched_at) > _SESSION_TURN_MAX_IDLE_SECONDS
+        ]
+        for sid in stale:
+            del SESSION_TURN_STORE[sid]
 
     # Guard: only write if the new message list is a strict append of the existing record.
     # If the existing record's messages are NOT a prefix of the incoming list, this request
@@ -2044,74 +2054,122 @@ _INBOUND_CONTEXT_HEADER = (
 )
 _INBOUND_CONTEXT_FENCE_OPEN = "```json"
 _INBOUND_CONTEXT_FENCE_CLOSE = "```"
+# Stable sentinel that replaces the ENTIRE Group Chat Context / Inbound Context
+# block (header + description lines + JSON fence) in the canonical cache key.
+# Using a single sentinel for the whole block — instead of replacing only the
+# JSON payload — ensures canonical form is IDENTICAL whether or not OpenClaw
+# included the block in a given turn.  OpenClaw sometimes omits the block
+# (confirmed in Phase 8 session logs: 44059 chars in T2, 43478 chars in T7),
+# which caused the entire KV cache to diverge at the omission point and produced
+# a 50.4% cache hit instead of the expected ~98%.
+_INBOUND_CONTEXT_STABLE_SECTION = "__STABLE_INBOUND_CONTEXT_SECTION__"
+# Anchor used for the "block absent" injection path.
+_PROJECT_CONTEXT_ANCHOR = "\n# Project Context"
 
 
 def _canonicalize_inbound_context_block(content: str) -> str:
     """
-    Replace the JSON payload inside the OpenClaw "Inbound Context (trusted metadata)"
-    block with a stable token, operating purely on the string at the content level
-    (no regex, no DOTALL).  Returns the modified string if the block is found;
-    returns the original string unchanged if the block is absent or already stable.
+    Canonicalize the OpenClaw "Group Chat Context / Inbound Context" section.
 
-    Safety guarantee: we only touch the text between the opening ```json fence and
-    the immediately-following ``` closing fence inside the Inbound Context block.
-    We stop at the first ``` that follows — we never scan past a second code fence.
+    Two cases are handled so the canonical form is IDENTICAL regardless of whether
+    OpenClaw included the block in a given turn (Phase 8 finding: the block is
+    sometimes present, sometimes absent, causing a 50.4% VLM cache hit instead of
+    the expected ~98% when the block is omitted in one turn but was present in the
+    turn whose KV state is cached).
+
+    Case A — block IS present:
+        Replace the ENTIRE block (from the '## Group Chat Context' line through
+        the closing ``` fence) with _INBOUND_CONTEXT_STABLE_SECTION.
+        Canonical: '...<before>\\n__STABLE_INBOUND_CONTEXT_SECTION__\\n# Project Context...'
+
+    Case B — block is ABSENT but '\\n# Project Context' anchor exists:
+        Insert _INBOUND_CONTEXT_STABLE_SECTION immediately before the anchor.
+        Canonical: same as Case A.
+
+    If neither condition is met, the content is returned unchanged (safe no-op).
+
+    Safety guarantees:
+    - Pure string operations, no regex, no DOTALL.
+    - Only touches the bounded region between the header and closing ```.
+    - Stops scanning after 10 description lines (cannot cross section boundaries).
+    - Idempotent: already-stable content is returned unchanged in one fast check.
     """
+    # Fast idempotency check.
+    if _INBOUND_CONTEXT_STABLE_SECTION in content:
+        return content
+
     header_pos = content.find(_INBOUND_CONTEXT_HEADER)
-    if header_pos == -1:
-        return content
 
-    # Start searching for ```json after the header.
-    search_start = header_pos + len(_INBOUND_CONTEXT_HEADER)
+    if header_pos != -1:
+        # --- Case A: block present ---
+        # Find the start of the '## Group Chat Context' line.
+        # header_pos already points there since _INBOUND_CONTEXT_HEADER begins with it.
+        # Walk forward (up to 10 lines) to find the opening ```json fence.
+        search_start = header_pos + len(_INBOUND_CONTEXT_HEADER)
+        fence_open_pos = -1
+        cursor = search_start
+        for _ in range(10):
+            line_end = content.find("\n", cursor)
+            if line_end == -1:
+                break
+            line = content[cursor:line_end]
+            if line.startswith(_INBOUND_CONTEXT_FENCE_OPEN):
+                fence_open_pos = cursor
+                break
+            # Stop if a new section header is encountered — prevents over-scanning.
+            if line.startswith("## ") or line.startswith("# "):
+                break
+            cursor = line_end + 1
 
-    # Allow up to 10 description lines before the opening fence.
-    # Uses plain string search (no regex, no DOTALL) — anchored at the header.
-    fence_open_pos = -1
-    cursor = search_start
-    for _ in range(10):
-        line_end = content.find("\n", cursor)
-        if line_end == -1:
-            break
-        line = content[cursor:line_end]
-        if line.startswith(_INBOUND_CONTEXT_FENCE_OPEN):
-            fence_open_pos = cursor
-            break
-        # Stop if we hit a new section header
-        if line.startswith("## ") or line.startswith("# "):
-            break
-        cursor = line_end + 1
+        if fence_open_pos == -1:
+            # JSON fence not found within 10 lines — leave unchanged (safe).
+            return content
 
-    if fence_open_pos == -1:
-        return content
+        # Find the closing ``` fence on its own line.
+        fence_line_end = content.find("\n", fence_open_pos)
+        if fence_line_end == -1:
+            return content
+        json_body_start = fence_line_end + 1
+        fence_close_pos = content.find(
+            "\n" + _INBOUND_CONTEXT_FENCE_CLOSE, json_body_start
+        )
+        if fence_close_pos == -1:
+            return content
+        # fence_close_pos + 1 = first ` of the closing fence.
+        # We advance past the full closing fence line (```\n) to get the remainder.
+        fence_end = fence_close_pos + 1 + len(_INBOUND_CONTEXT_FENCE_CLOSE)
+        # Skip the trailing newline if present.
+        if fence_end < len(content) and content[fence_end] == "\n":
+            fence_end += 1
 
-    # Already stable — no-op.
-    if "__STABLE_INBOUND_META__" in content[fence_open_pos : fence_open_pos + 200]:
-        return content
+        # Determine prefix boundary: keep the content immediately before the block.
+        # header_pos may be preceded by a newline we want to preserve.
+        block_start = header_pos
 
-    # Find the newline after ```json ... so we can locate the JSON body.
-    fence_line_end = content.find("\n", fence_open_pos)
-    if fence_line_end == -1:
-        return content
-    json_body_start = fence_line_end + 1
+        return (
+            content[:block_start]
+            + _INBOUND_CONTEXT_STABLE_SECTION
+            + "\n"
+            + content[fence_end:]
+        )
 
-    # Find the closing ``` fence.  It must be on its own line.
-    fence_close_pos = content.find("\n" + _INBOUND_CONTEXT_FENCE_CLOSE, json_body_start)
-    if fence_close_pos == -1:
-        return content
-    # fence_close_pos points to the '\n' before the closing ```.
-    # fence_close_pos + 1 is the first ` of the closing fence itself.
-    fence_close_start = fence_close_pos + 1
-
-    # Reconstruct: keep everything up to (and including) ```json\n,
-    # insert stable token, then the closing ``` fence and the rest.
-    # The closing fence is kept so the canonical form is well-formed markdown
-    # and _assert_cache_key_safety does not fire spuriously on large JSON blocks.
-    result = (
-        content[:json_body_start]
-        + "__STABLE_INBOUND_META__\n"
-        + content[fence_close_start:]
-    )
-    return result
+    else:
+        # --- Case B: block absent but # Project Context anchor present ---
+        # OpenClaw sometimes omits the Inbound Context section entirely.
+        # Insert the stable sentinel at the same relative position so the cache key
+        # matches turns where the block was present (Case A canonical form).
+        anchor_pos = content.find(_PROJECT_CONTEXT_ANCHOR)
+        if anchor_pos == -1:
+            return content  # No recognisable anchor — safe no-op.
+        # Insert stable sentinel on its own line immediately before the anchor.
+        # _PROJECT_CONTEXT_ANCHOR starts with '\n', so after anchor_pos we have
+        # '\n# Project Context'. We insert before that newline.
+        return (
+            content[:anchor_pos]
+            + "\n"
+            + _INBOUND_CONTEXT_STABLE_SECTION
+            + content[anchor_pos:]
+        )
 
 
 def _canonicalize_messages(
@@ -2149,8 +2207,10 @@ def _canonicalize_messages(
             content = INBOUND_META_MESSAGE_ID_PATTERN.sub(
                 r"\1__STABLE_MSG_ID__\2", content
             )
-            # 2. Inbound Context block.
+            # 2. Inbound Context block (system message — present or absent).
             content = _canonicalize_inbound_context_block(content)
+            # 3. Sub-agent completion stats (volatile runtime duration in user messages).
+            content = SUBAGENT_STATS_PATTERN.sub(r"\1__STABLE_RUNTIME__", content)
             msg["content"] = content
         elif isinstance(content, list):
             new_parts = []
@@ -2161,6 +2221,7 @@ def _canonicalize_messages(
                         r"\1__STABLE_MSG_ID__\2", text
                     )
                     text = _canonicalize_inbound_context_block(text)
+                    text = SUBAGENT_STATS_PATTERN.sub(r"\1__STABLE_RUNTIME__", text)
                     new_parts.append({**part, "text": text})
                 else:
                     new_parts.append(part)
@@ -2704,15 +2765,56 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if vlm_input_ids_raw is not None:
                 if hasattr(vlm_input_ids_raw, "flatten"):
-                    prompt_tokens = vlm_input_ids_raw.flatten().tolist()
+                    model_tokens = vlm_input_ids_raw.flatten().tolist()
                 else:
-                    prompt_tokens = list(vlm_input_ids_raw)
+                    model_tokens = list(vlm_input_ids_raw)
             else:
-                prompt_tokens = []
+                model_tokens = []
 
-            # VLM: model_tokens == prompt_tokens (single pipeline — VLM processor
-            # works on original messages after Step 3 removes in-place normalization).
-            model_tokens = prompt_tokens
+            # --- VLM DUAL PIPELINE: canonical cache key (Phase 8) ---
+            # The model always prefills from model_tokens (original messages, above).
+            # For the cache lookup we apply the same canonicalization as the LM path:
+            # _canonicalize_messages + _scrub_cache_key.  This ensures volatile fields
+            # in the system message (Inbound Context block, message IDs, etc.) do not
+            # cause cache divergence when OpenClaw changes them between turns.
+            # We use the VLM tokenizer's text-only apply_chat_template (CPU, no GPU
+            # required) so the canonical key is derived without a second model_lock
+            # acquisition.  Falls back to model_tokens if tokenizer is unavailable.
+            prompt_tokens = model_tokens  # safe fallback
+            if SETTINGS.cache_canonicalize_tool_context:
+                try:
+                    _, canonical_msgs_vlm = _canonicalize_messages(healed_messages)
+                    canon_prepared = _prepare_messages_for_vlm(
+                        canonical_msgs_vlm, tools=tools
+                    )
+                    # Resolve the text-only tokenizer from the VLM processor.
+                    _vlm_tok = None
+                    if processor is not None:
+                        if (
+                            hasattr(processor, "tokenizer")
+                            and processor.tokenizer is not None
+                            and hasattr(processor.tokenizer, "apply_chat_template")
+                            and getattr(processor.tokenizer, "chat_template", None)
+                        ):
+                            _vlm_tok = processor.tokenizer
+                        elif hasattr(processor, "apply_chat_template") and getattr(
+                            processor, "chat_template", None
+                        ):
+                            _vlm_tok = processor
+                    if _vlm_tok is not None:
+                        _canon_fmt = _vlm_tok.apply_chat_template(
+                            canon_prepared,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            tools=tools,
+                            enable_thinking=enable_thinking,
+                        )
+                        _canon_fmt = _scrub_cache_key(str(_canon_fmt))
+                        _canon_ids = _vlm_tok.encode(_canon_fmt)
+                        if isinstance(_canon_ids, list) and _canon_ids:
+                            prompt_tokens = _canon_ids
+                except Exception:
+                    pass  # Fall back to model_tokens — correct but no canonicalization
 
             prompt = ""
 
@@ -2770,8 +2872,17 @@ class APIHandler(BaseHTTPRequestHandler):
 
         session_ctx = _extract_session_context(body, prompt_tokens)
         if is_vlm:
-            prompt_was_normalized = bool(SETTINGS.cache_canonicalize_tool_context)
-            cache_key_delta_chars = 0
+            # prompt_was_normalized: True when canonical pipeline fired and produced
+            # different token count from model_tokens (i.e. canonicalization changed
+            # something). When the canonical pipeline falls back to model_tokens (no
+            # tokenizer available or canonicalization disabled), prompt_tokens ==
+            # model_tokens and we report no normalization.
+            prompt_was_normalized = bool(
+                SETTINGS.cache_canonicalize_tool_context
+                and prompt_tokens is not model_tokens
+                and len(prompt_tokens) != len(model_tokens)
+            )
+            cache_key_delta_chars = len(model_tokens) - len(prompt_tokens)
         cache_key = prompt_tokens[:]
         prompt_cache = None
         # model_tokens: tokens derived from the original (unmodified) prompt.
