@@ -48,6 +48,11 @@ When a longer cache entry is inserted, `_cull_redundant_prefixes` deletes shorte
 ### OOM From Unbounded Cache (Phase 4)
 `PROMPT_CACHE_MAX_ENTRIES_GLOBAL=64` at 20k tokens * 2.6 GB/entry = 167 GB theoretical. Also: `_insert_cache_entries` did unconditional `deepcopy` of full KV tensor on every turn. Fixed: max entries = 16, deepcopy gated to tool-call turns only, `mx.metal.clear_cache()` on eviction.
 
+### bf16→fp16 Conversion Breaks MLX Quantized Models
+Confirmed 2026-03-21: converting bf16 scales/biases to fp16 in mlx-community Q4 quants (Qwen3.5-27B-4bit, Qwen3.5-35B-A3B-4bit) produces garbage output. Model loads without error, tensors are numerically equivalent, but the model generates random tokens. MLX's quantized dequantization kernels depend on the scales dtype being bf16 — changing it to fp16 disrupts the Metal kernel compute path. The "bf16 emulation overhead on M1" claim from external optimization reports does not apply to MLX quantized inference.
+
+**Rule**: Never convert bf16→fp16 in quantized model weights. The dtype is load-bearing for MLX's quantized matmul kernels, not just a precision choice.
+
 ## MLX Cache API (confirmed)
 
 | Operation | Works? | Notes |

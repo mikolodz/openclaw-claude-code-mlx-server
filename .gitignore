@@ -10,6 +10,9 @@ __pycache__/
 venv/
 mlx_env/
 
+# Local model conversions (bf16→fp16)
+models/
+
 # Runtime artifacts
 logs/
 *.log
