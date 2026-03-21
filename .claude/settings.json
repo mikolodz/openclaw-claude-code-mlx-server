@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Bash(git *)",
+      "Bash(ls *)",
+      "Bash(python3 *)",
+      "Bash(python3.12 *)",
+      "Bash(curl *)",
+      "Bash(wc *)",
+      "Bash(mkdir *)",
+      "Bash(cat *)",
+      "Bash(pkill *)",
+      "Bash(pip *)",
+      "WebSearch"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force *)",
+      "Bash(git reset --hard *)"
+    ]
+  }
+}

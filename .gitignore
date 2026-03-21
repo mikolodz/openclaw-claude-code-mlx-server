@@ -13,9 +13,17 @@ mlx_env/
 # Runtime artifacts
 logs/
 *.log
+test_results/
 
+# Claude Code local settings
+.claude/settings.local.json
+
+# Legacy files (superseded by CLAUDE.md + .claude/ + .context/)
 AGENTS.md
 DDR.md
 GEMINI.md
 OC_CLAW_TEST.md
 OC_TEST.md
+PLAN.md
+TEST_PLAN_OPENCLAW.md
+PROJECT_STATE_FILES.md
