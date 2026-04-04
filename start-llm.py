@@ -138,7 +138,7 @@ def _env_bool_any(names: List[str], default: bool) -> bool:
     return default
 
 
-def _env_kv_bits(name: str, default: Optional[int]) -> Optional[int]:
+def _env_kv_bits(name: str, default: Optional[float]) -> Optional[float]:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
         return default
@@ -146,7 +146,7 @@ def _env_kv_bits(name: str, default: Optional[int]) -> Optional[int]:
     if normalized == "OFF":
         return None
     try:
-        return int(normalized)
+        return float(normalized)
     except ValueError:
         return default
 
@@ -164,7 +164,9 @@ class Settings:
     prompt_cache_session_max_idle_seconds: int
     max_kv_size: int
     kv_group_size: int
-    kv_bits: Optional[int]
+    kv_bits: Optional[float]
+    kv_quant_scheme: str
+    quantized_kv_start: int
     default_temperature: float
     default_top_p: float
     default_top_k: int
@@ -235,6 +237,8 @@ def _build_settings() -> Settings:
         max_kv_size=_env_int("MAX_KV_SIZE", 196608),
         kv_group_size=_env_int("KV_GROUP_SIZE", 64),
         kv_bits=_env_kv_bits("KV_BITS", None),
+        kv_quant_scheme=_env_str("KV_QUANT_SCHEME", "uniform"),
+        quantized_kv_start=_env_int("QUANTIZED_KV_START", 5000),
         default_temperature=_env_float("DEFAULT_TEMPERATURE", 0.1),
         default_top_p=_env_float("DEFAULT_TOP_P", 0.9),
         default_top_k=_env_int("DEFAULT_TOP_K", 40),
@@ -272,53 +276,64 @@ def _build_settings() -> Settings:
 
 SETTINGS = _build_settings()
 
-# VLM model_type whitelist (from mlx-vlm prompt_utils / supported architectures).
+# VLM model_type whitelist (from mlx-vlm 0.4.3 models/ directory).
 VLM_MODEL_TYPES = frozenset(
     {
-        "qwen2_vl",
-        "qwen2_5_vl",
-        "qwen3_vl",
-        "qwen3_vl_moe",
-        "qwen3_5",
-        "qwen3_5_moe",
-        "qwen3_omni_moe",
-        "glm4v",
-        "glm4v_moe",
-        "glm_ocr",
-        "llava",
-        "llava_next",
-        "llava_qwen2",
-        "llava_bunny",
-        "idefics2",
-        "idefics3",
-        "mistral3",
-        "gemma3",
-        "gemma3n",
-        "pixtral",
+        "aya_vision",
         "deepseek_vl_v2",
         "deepseekocr",
         "deepseekocr_2",
-        "aya_vision",
-        "cohere2_vision",
+        "dots_ocr",
+        "ernie4_5_moe_vl",
+        "falcon_ocr",
+        "falcon_perception",
+        "fastvlm",
+        "florence2",
+        "gemma3",
+        "gemma3n",
+        "gemma4",
+        "glm4v",
+        "glm4v_moe",
+        "glm_ocr",
+        "granite4_vision",
+        "granite_vision",
+        "hunyuan_vl",
+        "idefics2",
+        "idefics3",
         "internvl_chat",
+        "jina_vlm",
         "kimi_vl",
+        "lfm2_vl",
+        "llama4",
+        "llava",
+        "llava_bunny",
+        "llava_next",
+        "minicpmo",
+        "mistral3",
+        "mistral4",
+        "mllama",
         "molmo",
         "molmo2",
-        "smolvlm",
-        "jina_vlm",
-        "jvlm",
-        "phi3_v",
-        "paligemma",
-        "florence2",
+        "molmo_point",
+        "moondream3",
         "multi_modality",
-        "mllama",
-        "llama4",
-        "dots_ocr",
         "paddleocr_vl",
-        "ernie4_5_moe_vl",
-        "lfm2_vl",
-        "hunyuan_vl",
-        "bunny-llama",
+        "paligemma",
+        "phi3_v",
+        "phi4_siglip",
+        "phi4mm",
+        "pixtral",
+        "qwen2_5_vl",
+        "qwen2_vl",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_omni_moe",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+        "rfdetr",
+        "sam3",
+        "sam3_1",
+        "smolvlm",
     }
 )
 
@@ -2606,6 +2621,12 @@ _terminal_status(
         f"healing_store_capacity={MAX_HEALING_STORE}"
     ),
 )
+_kv_desc = f"bits={SETTINGS.kv_bits}" if SETTINGS.kv_bits is not None else "OFF"
+if SETTINGS.kv_bits is not None and SETTINGS.kv_quant_scheme == "turboquant":
+    _kv_desc += f" scheme=turboquant start={SETTINGS.quantized_kv_start}"
+elif SETTINGS.kv_bits is not None:
+    _kv_desc += f" scheme=uniform group_size={SETTINGS.kv_group_size}"
+_terminal_status("🗜️", f"KV Cache Quantization: {_kv_desc}")
 
 
 def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
@@ -2677,6 +2698,8 @@ def _stream_generate_unified(
             "sampler": sampler,
             "max_kv_size": SETTINGS.max_kv_size,
             "kv_group_size": SETTINGS.kv_group_size,
+            "kv_quant_scheme": SETTINGS.kv_quant_scheme,
+            "quantized_kv_start": SETTINGS.quantized_kv_start,
         }
         if SETTINGS.kv_bits is not None:
             kwargs["kv_bits"] = SETTINGS.kv_bits
