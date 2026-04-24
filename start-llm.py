@@ -18,7 +18,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
 from dotenv import load_dotenv
 
 # --- THE METAL CRASH FIX (CPU QUARANTINE) ---
@@ -177,6 +177,7 @@ class Settings:
     enable_request_logging: bool
     default_thinking: bool
     vlm_cache_debug: bool
+    cache_vlm_image_identity: bool
     normalize_write_tool_content_for_prompt: bool
     cache_canonicalize_tool_context: bool
     cache_session_partitioning: bool
@@ -186,6 +187,8 @@ class Settings:
     log_root: Path
     proxy_startup_wait_seconds: float
     proxy_model_id: str
+    preserve_thinking: bool
+    generation_watchdog_seconds: int
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -251,6 +254,7 @@ def _build_settings() -> Settings:
         enable_request_logging=_env_bool("ENABLE_REQUEST_LOGGING", True),
         default_thinking=_env_bool("DEFAULT_THINKING", True),
         vlm_cache_debug=_env_bool("VLM_CACHE_DEBUG", False),
+        cache_vlm_image_identity=_env_bool("CACHE_VLM_IMAGE_IDENTITY", True),
         normalize_write_tool_content_for_prompt=_env_bool(
             "NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", False
         ),
@@ -271,6 +275,8 @@ def _build_settings() -> Settings:
         log_root=Path(_env_str("LOG_ROOT", str(SCRIPT_DIR / "logs"))),
         proxy_startup_wait_seconds=_env_float("PROXY_STARTUP_WAIT_SECONDS", 2.0),
         proxy_model_id=proxy_model_id,
+        preserve_thinking=_env_bool("PRESERVE_THINKING", True),
+        generation_watchdog_seconds=_env_int("GENERATION_WATCHDOG_SECONDS", 600),
     )
 
 
@@ -458,10 +464,458 @@ def _strip_thinking_from_content(text: str) -> str:
     return out.strip()
 
 
+# --- Streaming reasoning splitter ---
+# Single source of truth for splitting raw model output into three disjoint
+# streams: reasoning (goes to OpenAI `delta.reasoning_content`), content (goes
+# to `delta.content`), and a tool-call tail buffered for end-of-stream
+# extraction via `_extract_openai_tool_calls`.
+#
+# Why a state machine instead of post-hoc regex: the SSE path needs to emit
+# deltas live during generation so clients (PI, OpenClaw, Claude) render
+# thinking blocks and answer text as they arrive instead of receiving a single
+# "answer dump" at end-of-stream.  A regex pass only works on the full string.
+#
+# Invariant (non-pathological cases — every `<think>` eventually closed):
+#     "".join(content_chunks) == stripped text (modulo trailing whitespace),
+#     where "stripped" means the same transform `_strip_thinking_from_content`
+#     performs — <think>...</think> + trailing \s* removed, plus orphan
+#     leading ...</think> handled for non-qwen3 thinking turns.
+#
+# Pathological case (thinking=True but the model never emits </think>): the
+# entire output is routed to reasoning_content.  Legacy `_strip_thinking_from_content`
+# would have left the prepended "<think>" prefix in `message.content` in this
+# case; strictly better UX to route the stream to the reasoning channel.  The
+# non-streaming path keeps the legacy transform for `message.content` (purely
+# additive `reasoning_content` field) so no back-compat break.
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+_TOOL_CALL_OPEN_TAG = "<tool_call>"
+_STREAM_SENTINEL_LOOKBACK = (
+    max(len(_THINK_OPEN_TAG), len(_THINK_CLOSE_TAG), len(_TOOL_CALL_OPEN_TAG)) - 1
+)
+
+
+class _ReasoningStreamSplitter:
+    """
+    Feed raw model text; get ('reasoning'|'content', str) chunks out.  Call
+    `flush()` at end-of-stream for residual emission plus the raw tool-call
+    buffer (for downstream `_extract_openai_tool_calls`).
+
+    Lookback: holds up to `_STREAM_SENTINEL_LOOKBACK` trailing chars in the
+    internal buffer so a `<think>` / `</think>` / `<tool_call>` tag split
+    across two generated-text chunks is detected correctly.  Content deltas
+    therefore lag the true generation by up to that many chars — acceptable
+    (< one visible token for every model we run).
+
+    Tool-call mode: entering on first `<tool_call>` sentinel stops all
+    content/reasoning emission and buffers the rest of the stream for
+    end-of-stream extraction.  Text that precedes the sentinel is still
+    emitted as content.  Text that follows `</tool_call>` in the same stream
+    is returned from `flush()` via `_extract_openai_tool_calls` cleaning and
+    emitted as a final content delta in the caller (mirroring the
+    non-streaming behaviour where trailing text after a tool call stays in
+    `message.content`).
+    """
+
+    MODE_REASONING = "reasoning"
+    MODE_CONTENT = "content"
+    MODE_TOOL = "tool"
+
+    def __init__(self, enable_thinking: bool, model_family: str):
+        self._enable_thinking = bool(enable_thinking)
+        self._model_family = model_family
+        self._buf = ""
+        # When thinking is requested, start in REASONING.  This mirrors
+        # `_normalize_assistant_text` which prepends "<think>" for non-qwen3
+        # (so the orphan-close case is handled naturally) and for qwen3
+        # (where the chat template supplies the opening `<think>` inside the
+        # rendered prompt, so the model's generated output begins mid-think
+        # and emits `</think>` before the answer).
+        self._mode = self.MODE_REASONING if self._enable_thinking else self.MODE_CONTENT
+        # Consume a single leading "<think>" tag if present (Qwen3 variants
+        # whose templates do not pre-open the think block).  Checked once.
+        self._consumed_leading_think_tag = False
+        # After consuming `</think>`, the `\s*` trail in
+        # `_strip_thinking_from_content` eats any whitespace before the answer.
+        # If that whitespace arrives in a LATER feed, we cannot consume it
+        # in the same pass as the close tag — this flag defers the strip
+        # into CONTENT mode's next iteration.
+        self._pending_content_ws_strip = False
+        self._tool_buffer = ""
+
+    def feed(self, text: str) -> List[Tuple[str, str]]:
+        out: List[Tuple[str, str]] = []
+        if not text:
+            return out
+        self._buf += text
+        self._process(out, final=False)
+        return out
+
+    def flush(self) -> Tuple[List[Tuple[str, str]], str]:
+        """End-of-stream drain.  Returns (chunks, tool_buffer)."""
+        out: List[Tuple[str, str]] = []
+        self._process(out, final=True)
+        if self._buf:
+            if self._mode == self.MODE_CONTENT:
+                trimmed = self._buf.rstrip()
+                if trimmed:
+                    out.append(("content", trimmed))
+            elif self._mode == self.MODE_REASONING:
+                out.append(("reasoning", self._buf))
+            # MODE_TOOL: already captured into self._tool_buffer.
+            self._buf = ""
+        tool_text = self._tool_buffer
+        self._tool_buffer = ""
+        return out, tool_text
+
+    def _process(self, out: List[Tuple[str, str]], final: bool) -> None:
+        while self._buf:
+            if self._mode == self.MODE_TOOL:
+                self._tool_buffer += self._buf
+                self._buf = ""
+                return
+            if self._mode == self.MODE_REASONING:
+                if not self._consumed_leading_think_tag:
+                    stripped = self._buf.lstrip()
+                    ws_len = len(self._buf) - len(stripped)
+                    if stripped.startswith(_THINK_OPEN_TAG):
+                        self._buf = self._buf[ws_len + len(_THINK_OPEN_TAG):]
+                        self._consumed_leading_think_tag = True
+                        continue
+                    if len(stripped) >= len(_THINK_OPEN_TAG):
+                        # Enough chars to rule out a leading <think>.
+                        self._consumed_leading_think_tag = True
+                    elif not final:
+                        return  # Wait for more data.
+                    else:
+                        self._consumed_leading_think_tag = True
+                close_idx = self._buf.find(_THINK_CLOSE_TAG)
+                if close_idx == -1:
+                    hold = len(_THINK_CLOSE_TAG) - 1 if not final else 0
+                    emit_upto = max(0, len(self._buf) - hold)
+                    if emit_upto > 0:
+                        out.append(("reasoning", self._buf[:emit_upto]))
+                        self._buf = self._buf[emit_upto:]
+                    return
+                if close_idx > 0:
+                    out.append(("reasoning", self._buf[:close_idx]))
+                consumed = close_idx + len(_THINK_CLOSE_TAG)
+                # Consume \s* after </think> to match _strip_thinking_from_content.
+                while consumed < len(self._buf) and self._buf[consumed] in " \t\n\r":
+                    consumed += 1
+                # If we ran out of buffer while still on whitespace territory,
+                # finish the \s* strip on the next feed in CONTENT mode.
+                self._pending_content_ws_strip = consumed >= len(self._buf)
+                self._buf = self._buf[consumed:]
+                self._mode = self.MODE_CONTENT
+                continue
+            # MODE_CONTENT
+            if self._pending_content_ws_strip and self._buf:
+                stripped = self._buf.lstrip()
+                ws_count = len(self._buf) - len(stripped)
+                if ws_count > 0:
+                    self._buf = stripped
+                if stripped:
+                    # First non-whitespace char seen — done stripping.
+                    self._pending_content_ws_strip = False
+                elif not final:
+                    # Still pure whitespace and more data may come; wait.
+                    return
+            open_think_idx = self._buf.find(_THINK_OPEN_TAG)
+            open_tool_idx = self._buf.find(_TOOL_CALL_OPEN_TAG)
+            candidates = [i for i in (open_think_idx, open_tool_idx) if i != -1]
+            if candidates:
+                sentinel_idx = min(candidates)
+                if sentinel_idx > 0:
+                    out.append(("content", self._buf[:sentinel_idx]))
+                if sentinel_idx == open_think_idx and (
+                    open_tool_idx == -1 or open_think_idx <= open_tool_idx
+                ):
+                    self._buf = self._buf[sentinel_idx + len(_THINK_OPEN_TAG):]
+                    self._mode = self.MODE_REASONING
+                else:
+                    # Tool-call sentinel: preserve the tag itself in the buffer
+                    # so `_extract_openai_tool_calls` can find it end-of-stream.
+                    self._tool_buffer += self._buf[sentinel_idx:]
+                    self._buf = ""
+                    self._mode = self.MODE_TOOL
+                continue
+            hold = _STREAM_SENTINEL_LOOKBACK if not final else 0
+            emit_upto = max(0, len(self._buf) - hold)
+            if emit_upto > 0:
+                chunk = self._buf[:emit_upto]
+                if final:
+                    # Mirror `_strip_thinking_from_content`'s trailing
+                    # `.strip()` so the concatenation of content deltas the
+                    # client sees is byte-identical to what the non-streaming
+                    # path returns in `message.content`.  Healing-store
+                    # lookups otherwise diverge when a client retries a
+                    # stream=true request as stream=false (or vice versa).
+                    chunk = chunk.rstrip()
+                if chunk:
+                    out.append(("content", chunk))
+                self._buf = self._buf[emit_upto:]
+            return
+
+
+def _split_text_for_reasoning(
+    raw_text: str,
+    enable_thinking: bool,
+    model_family: str,
+) -> Tuple[str, str]:
+    """
+    Apply the streaming splitter to a complete raw_text buffer for the
+    non-streaming path.  Returns `(content, reasoning)`.  Tool-call extraction
+    is left to the caller (consistent with the streaming path).
+
+    Used to produce the `message.reasoning_content` field on non-streaming
+    responses additively — `message.content` remains derived from
+    `_strip_thinking_from_content` so any client that does not consume
+    `reasoning_content` sees byte-identical legacy content.
+    """
+    if not isinstance(raw_text, str) or not raw_text:
+        return "", ""
+    splitter = _ReasoningStreamSplitter(enable_thinking, model_family)
+    chunks = splitter.feed(raw_text)
+    tail, _tool_text = splitter.flush()
+    chunks.extend(tail)
+    content = "".join(c for k, c in chunks if k == "content")
+    reasoning = "".join(c for k, c in chunks if k == "reasoning")
+    return content, reasoning
+
+
+def _selftest_reasoning_splitter() -> None:
+    """
+    Import-time invariant check for `_ReasoningStreamSplitter`.  Runs once at
+    startup; raises AssertionError on regression so the server refuses to
+    start rather than silently shipping a broken reasoning split.  Keeping it
+    here (no external test harness in this repo) preserves rule 9's
+    "evidence before code" discipline for a state machine that is otherwise
+    easy to break with a lookback off-by-one.
+    """
+    cases = [
+        # (raw, enable_thinking, model_family, expected_content, expected_reasoning, expected_tool)
+        ("<think>r</think>\nans", True, "qwen3", "ans", "r", ""),
+        ("r</think>\nans", True, "glm4", "ans", "r", ""),
+        ("no think", False, "qwen3", "no think", "", ""),
+        (
+            "<think>r1</think>\n\nans <think>r2</think> more",
+            True, "qwen3", "ans more", "r1r2", "",
+        ),
+        (
+            "reasoning</think>\n<tool_call><function=foo></function></tool_call>",
+            True, "glm4", "", "reasoning",
+            "<tool_call><function=foo></function></tool_call>",
+        ),
+        (
+            "<tool_call>x</tool_call>", False, "qwen3",
+            "", "", "<tool_call>x</tool_call>",
+        ),
+        ("unclosed thinking", True, "glm4", "", "unclosed thinking", ""),
+        # Trailing whitespace — splitter output must match _strip_thinking_from_content.
+        ("<think>r</think>\nans\n", True, "qwen3", "ans", "r", ""),
+        ("<think>r</think>\n  answer  ", True, "qwen3", "answer", "r", ""),
+        # Content already in stream at flush with no closing newline.
+        ("r</think>answer", True, "glm4", "answer", "r", ""),
+    ]
+    for raw, et, mf, exp_c, exp_r, exp_t in cases:
+        # Chunk size 3 to exercise tag-split lookback.
+        splitter = _ReasoningStreamSplitter(et, mf)
+        collected: List[Tuple[str, str]] = []
+        for i in range(0, len(raw), 3):
+            collected.extend(splitter.feed(raw[i:i + 3]))
+        tail, tool_text = splitter.flush()
+        collected.extend(tail)
+        got_c = "".join(c for k, c in collected if k == "content")
+        got_r = "".join(c for k, c in collected if k == "reasoning")
+        assert got_c == exp_c, (
+            f"splitter content mismatch raw={raw!r} got={got_c!r} exp={exp_c!r}"
+        )
+        assert got_r == exp_r, (
+            f"splitter reasoning mismatch raw={raw!r} got={got_r!r} exp={exp_r!r}"
+        )
+        assert tool_text == exp_t, (
+            f"splitter tool mismatch raw={raw!r} got={tool_text!r} exp={exp_t!r}"
+        )
+
+    # Additional invariant: for any CLOSED-thinking case with NO tool call,
+    # the stream-view content must equal
+    # `_strip_thinking_from_content(_normalize_assistant_text(raw))` so
+    # streaming and non-streaming content stay byte-identical (healing-
+    # hash integrity).  Unclosed-thinking (pathological) and tool-call cases
+    # are excluded — see class docstring for why.
+    #
+    # `_normalize_assistant_text` is defined later in this file; the caller
+    # at module load time (see `_selftest_reasoning_splitter_run_after_deps`
+    # below) schedules this check to run AFTER that definition.  Falling
+    # back to an inline shim here keeps the selftest self-contained if
+    # someone invokes it in isolation.
+    def _legacy_normalize(text: str, et: bool, mf: str) -> str:
+        normalize = globals().get("_normalize_assistant_text")
+        if normalize is not None:
+            return normalize(text, et, mf)
+        if mf == "qwen3":
+            return text
+        if et and text and not text.lstrip().startswith("<think>"):
+            return "<think>" + text
+        return text
+
+    for raw, et, mf, _exp_c, _exp_r, exp_t in cases:
+        if exp_t:
+            continue
+        if et and "</think>" not in raw:
+            continue  # pathological: documented divergence
+        splitter = _ReasoningStreamSplitter(et, mf)
+        chunks = splitter.feed(raw)
+        tail, _ = splitter.flush()
+        chunks.extend(tail)
+        got_c = "".join(c for k, c in chunks if k == "content")
+        if et:
+            legacy = _strip_thinking_from_content(_legacy_normalize(raw, et, mf))
+        else:
+            legacy = raw  # thinking off → no stripping on non-streaming
+        assert got_c == legacy, (
+            f"splitter/legacy divergence raw={raw!r} et={et} mf={mf} "
+            f"splitter={got_c!r} legacy={legacy!r}"
+        )
+
+
+# Run the splitter-only part of the selftest immediately (no forward
+# references).  The equivalence subtest inside `_selftest_reasoning_splitter`
+# looks up `_normalize_assistant_text` dynamically via globals() so it is safe
+# to call here even though the real function is defined further down — it
+# falls back to an inline shim.  This keeps import-time failure loud if the
+# splitter regresses.
+_selftest_reasoning_splitter()
+
+
 # --- STATELESS MESSAGE HEALING STORE ---
 HEALING_STORE: OrderedDict = OrderedDict()
 HEALING_STORE_LOCK = threading.Lock()
 MAX_HEALING_STORE = 2000  # Generous size to survive deep multi-agent sessions
+
+
+# --- P4: Cache-correctness observability ---
+# Three counters that must stay at 0 on clean traffic.  Any bump is a signal
+# that an assumption from P1-P3 has slipped.  See LESSONS.md "Cache-
+# Correctness Metrics" and .context/TASKS.md P4 row for interpretation.
+#
+#  vlm_retreat                    — G1 failed to prevent a mid-image cache cut
+#                                   (canonical key collided with a different
+#                                   image expansion).  Expected: 0.
+#  hybrid_trim_miss               — `_trim_to_model_depth` rejected reuse
+#                                   because `can_trim_prompt_cache` was False
+#                                   on a hybrid VLM cache.  Nonzero justifies
+#                                   G4 (pre-generation prompt-only checkpoint).
+#  exact_key_rejected_by_model_lcp — exact canonical-key hit rejected because
+#                                   `entry.model_tokens` was not a prefix of
+#                                   the new request's model_tokens.  Nonzero
+#                                   indicates a canonical-key derivation bug
+#                                   (two distinct model streams producing the
+#                                   same canonical key); tracked under G6.
+_CACHE_METRICS: Dict[str, int] = {
+    "vlm_retreat": 0,
+    "hybrid_trim_miss": 0,
+    "exact_key_rejected_by_model_lcp": 0,
+}
+_CACHE_METRICS_LOCK = threading.Lock()
+# Per-request tracking: which counters bumped during THIS request, keyed by
+# request_id.  Cleaned on request completion.  Enables the request log to
+# report `cache_metrics_bumped_this_request` without the request having to
+# thread state through the counter callers.
+_CACHE_METRICS_PER_REQUEST: Dict[str, List[str]] = {}
+
+
+def _bump_metric(name: str, request_id: Optional[str] = None, by: int = 1) -> int:
+    """
+    Atomically bump a cache-correctness counter.  Returns the new total.
+    Also emits a one-line terminal status (`🧪 metric <name> bumped ...`)
+    so an operator sees the event immediately — bumps are rare by design,
+    so the noise is low and signal is high.
+    """
+    with _CACHE_METRICS_LOCK:
+        if name not in _CACHE_METRICS:
+            _CACHE_METRICS[name] = 0
+        _CACHE_METRICS[name] += by
+        new_total = _CACHE_METRICS[name]
+        if request_id:
+            bucket = _CACHE_METRICS_PER_REQUEST.setdefault(request_id, [])
+            if name not in bucket:
+                bucket.append(name)
+    # Emit OUTSIDE the lock: _terminal_status takes console_lock, so keeping
+    # the two lock regions disjoint removes any future ordering hazard if
+    # console code ever needs to read metrics.
+    _terminal_status(
+        "🧪",
+        f"metric {name} bumped (+{by}, total={new_total})"
+        + (f" request={request_id}" if request_id else ""),
+        indent=1,
+    )
+    return new_total
+
+
+def _metrics_snapshot() -> Dict[str, int]:
+    with _CACHE_METRICS_LOCK:
+        return dict(_CACHE_METRICS)
+
+
+def _metrics_drain_request(request_id: str) -> List[str]:
+    """Pop and return the list of counters that bumped for `request_id`."""
+    with _CACHE_METRICS_LOCK:
+        return _CACHE_METRICS_PER_REQUEST.pop(request_id, [])
+
+
+# Thread-local request id — used so the cache-layer bump sites (inside
+# LRUPromptCache methods) can attribute to the request without having
+# request_id threaded through every call.  Safe under the single-threaded
+# HTTPServer (all requests share a single stack; set at do_POST entry and
+# cleared in finally).  Under any future threaded server this would need
+# revisiting; the server-level comment at run() already calls that out.
+_current_request_id_tls = threading.local()
+
+
+def _set_current_request_id(request_id: Optional[str]) -> None:
+    _current_request_id_tls.value = request_id
+
+
+def _current_request_id() -> Optional[str]:
+    return getattr(_current_request_id_tls, "value", None)
+
+
+def _canonicalize_tool_calls_for_hash(
+    tool_calls: Optional[List[Dict[str, Any]]],
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Normalize tool_calls for stable hashing across clients that serialize
+    `function.arguments` differently.  The server emits arguments as a
+    JSON-STRING (per OpenAI spec); clients like pi echo them back as a
+    native DICT.  Without canonicalization the healing hash diverges and
+    cache hits are lost on every tool-call turn.
+
+    Canonical form: arguments is ALWAYS a parsed mapping (dict) when the
+    string is valid JSON; otherwise a raw-string placeholder.  The `id`
+    field is kept (OpenAI uses it to bind tool results).
+    """
+    if not tool_calls:
+        return None
+    out: List[Dict[str, Any]] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            out.append(tc)
+            continue
+        tc_copy = dict(tc)
+        fn = tc_copy.get("function")
+        if isinstance(fn, dict):
+            fn_copy = dict(fn)
+            args = fn_copy.get("arguments")
+            if isinstance(args, str):
+                try:
+                    fn_copy["arguments"] = json.loads(args)
+                except Exception:
+                    fn_copy["arguments"] = {"__raw__": args}
+            tc_copy["function"] = fn_copy
+        out.append(tc_copy)
+    return out
 
 
 def _get_healing_hash(
@@ -472,10 +926,10 @@ def _get_healing_hash(
     If the text is empty but has tool calls, we hash the canonicalized tool calls.
     """
     base = (text or "").strip()
-    if tool_calls:
+    canon = _canonicalize_tool_calls_for_hash(tool_calls)
+    if canon:
         try:
-            # Sort keys to ensure deterministic hashing of tool calls
-            base += json.dumps(tool_calls, sort_keys=True)
+            base += json.dumps(canon, sort_keys=True, ensure_ascii=False)
         except Exception:
             pass
 
@@ -485,10 +939,65 @@ def _get_healing_hash(
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
+def _reasoning_already_embedded_in_content(
+    reasoning_content: Any, content: Any
+) -> bool:
+    """
+    True only when `content` already carries `reasoning_content` immediately
+    followed by `</think>` — i.e. the flattening pattern clients like pi use
+    to round-trip reasoning streams through OpenAI-style `messages[*].content`.
+
+    Strict check by design: a substring match of just `</think>` would misfire
+    on prompts that legitimately contain that literal (LLM-tooling discussions,
+    template docs, chat logs of other agents).  Requiring the exact
+    `reasoning_content + "</think>"` adjacency matches pi's echo and any other
+    client using the same flattening, while leaving unrelated content alone.
+    """
+    if not isinstance(reasoning_content, str) or not reasoning_content:
+        return False
+    marker = reasoning_content + "</think>"
+
+    def _text_carries_marker(text: Any) -> bool:
+        return isinstance(text, str) and marker in text
+
+    if _text_carries_marker(content):
+        return True
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text") or part.get("content") or ""
+                if _text_carries_marker(text):
+                    return True
+    return False
+
+
 def _heal_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Intercepts incoming messages. If a stripped assistant message matches
     a hash in our store, we swap it back to the full version (with <think>).
+
+    Also collapses pi-style echoes that set BOTH `content` (with thinking +
+    `</think>` embedded) AND `reasoning_content`: the Qwen3.6 chat template
+    with `preserve_thinking=True` uses `reasoning_content` to inject a
+    `<think>…</think>` wrapper AND renders `content` verbatim — so any client
+    that also puts the thinking inside `content` doubles the block, shifts
+    every subsequent token, and turns the cache into a cold miss on every
+    turn.  Verified against `chat_template.jinja`: when `reasoning_content`
+    is absent, the template's preserve_thinking pass extracts the thinking
+    from `content` at `</think>` and produces a byte-identical render to the
+    model's original generation — so preserving the flag (and therefore the
+    prior-reasoning context for the model) is safe; we only drop the
+    redundant second copy.
+
+    The guard is strict on purpose: we drop `reasoning_content` only when
+    the SAME string literally appears inside `content` immediately before
+    `</think>`.  That signature uniquely identifies the flattening pi
+    performs when it round-trips the server's reasoning-aware stream
+    through an OpenAI-shaped `messages` payload.  The common
+    stripped-content-plus-reasoning_content case (legitimate supplementary
+    reasoning) is left untouched; pathological content that contains a
+    literal `</think>` without the matching reasoning prefix is also left
+    untouched — at worst one cache miss, never a silent-correctness loss.
     """
     healed = []
     for msg in messages:
@@ -531,6 +1040,17 @@ def _heal_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 if healed_any:
                     # CRITICAL: Prevent double-rendering for VLM multi-part messages too
                     m.pop("tool_calls", None)
+
+            # Drop the redundant `reasoning_content` copy when the same
+            # thinking text is already embedded inside `content`, preceding
+            # `</think>`.  preserve_thinking still takes effect (the template
+            # extracts the block from content), so the model keeps its prior
+            # reasoning; only the duplicate render is removed.  See docstring
+            # above for the safety argument behind the strict-prefix guard.
+            if _reasoning_already_embedded_in_content(
+                m.get("reasoning_content"), m.get("content")
+            ):
+                m.pop("reasoning_content", None)
 
         healed.append(m)
     return healed
@@ -631,7 +1151,8 @@ class LRUPromptCache:
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
-        tokens: Tuple[int, ...]
+        tokens: Tuple[int, ...]  # canonical cache_key = canonical prompt + generated
+        model_tokens: Tuple[int, ...]  # model-space tokens used to BUILD the KV state
         count: int
         touched_at: float
 
@@ -690,6 +1211,7 @@ class LRUPromptCache:
         return self.CacheEntry(
             copy.deepcopy(entry.prompt_cache),
             entry.tokens,
+            entry.model_tokens,
             entry.count,
             entry.touched_at,
         )
@@ -721,18 +1243,44 @@ class LRUPromptCache:
         if best_key:
             self._delete(best_key[0], best_key[1])
 
-    def _cull_redundant_prefixes(self, model, new_tokens):
+    def _cull_redundant_prefixes(self, model, new_tokens, new_model_tokens=None):
         """
-        Frees up slots by removing strict prefixes. Since the cache can trim
-        longer chains to serve shorter ones, shorter strict prefixes are wasted slots.
+        Frees up slots by removing strict prefixes.  Since the cache can trim
+        longer chains to serve shorter ones, shorter strict prefixes are
+        wasted slots — when both canonical AND model tokens line up.
+
+        P6/1d: For VLM the canonical-prefix relation alone is insufficient.
+        Two distinct entries can share a canonical prefix (say up to the
+        system-prompt / image marker boundary) while their `model_tokens`
+        diverge because of different image expansions or per-client token
+        drift.  Culling the shorter of two such entries silently discards
+        a genuinely distinct KV state.  If `new_model_tokens` is provided,
+        also require `new_model_tokens[:len(entry.model_tokens)] ==
+        entry.model_tokens` before culling.  Callers that don't supply
+        `new_model_tokens` (none in the current code, but kept for
+        back-compat) fall back to the pre-P6 canonical-only check.
+
+        With G1's image-identity markers, canonical collisions across
+        distinct images are already prevented at the derivation layer;
+        this guard is belt-and-braces for any future normalisation pass
+        that might reintroduce cross-model-stream canonical aliasing.
         """
         new_len = len(new_tokens)
         to_delete = []
-        for m, t_tup in self._entries.keys():
-            if m == model and len(t_tup) < new_len:
-                # If the existing shorter cache is a strict prefix of the new one
-                if new_tokens[: len(t_tup)] == t_tup:
-                    to_delete.append((m, t_tup))
+        for (m, t_tup), entry in self._entries.items():
+            if m != model or len(t_tup) >= new_len:
+                continue
+            if new_tokens[: len(t_tup)] != t_tup:
+                continue
+            if new_model_tokens is not None:
+                entry_model = entry.model_tokens
+                if len(entry_model) > len(new_model_tokens):
+                    continue
+                if tuple(new_model_tokens[: len(entry_model)]) != tuple(entry_model):
+                    # Same canonical prefix, divergent model stream — do
+                    # NOT cull; this is a genuinely distinct KV state.
+                    continue
+            to_delete.append((m, t_tup))
 
         to_delete.sort(key=lambda x: len(x[1]), reverse=True)
         if to_delete:
@@ -742,128 +1290,284 @@ class LRUPromptCache:
         for k in to_delete:
             self._delete(k[0], k[1])
 
-    def fetch_nearest_cache(self, model, tokens):
+    @staticmethod
+    def _lcp(a: Tuple[int, ...], b: Tuple[int, ...], limit: Optional[int] = None) -> int:
+        """Longest common prefix length between two integer token sequences."""
+        n = min(len(a), len(b))
+        if limit is not None:
+            n = min(n, limit)
+        i = 0
+        while i < n and a[i] == b[i]:
+            i += 1
+        return i
+
+    def fetch_nearest_cache(self, model, tokens, request_model_tokens=None):
+        """
+        Lookup a cached KV state that can serve `tokens` (canonical request
+        cache key).  Uses canonical block hashes for candidate discovery, then
+        verifies match in MODEL-token space using `request_model_tokens` —
+        this guards against VLM cross-request leakage where two requests
+        share a canonical prefix but diverge in image-pad expansion.
+
+        Returns a tuple
+            (prompt_cache, rest_model_tokens, selected_canonical_tokens,
+             match_type, canonical_matched_prefix_len)
+        where the returned `prompt_cache` has already been trimmed to the
+        correct model-space KV depth (use `_kv_cache_offset(prompt_cache)` to
+        read it back).  `rest_model_tokens` is the remaining tail of the new
+        request's model_tokens that still needs prefilling.
+
+        For text-only (LM) paths, canonical == model; callers can pass
+        `request_model_tokens=None` and the routine falls back to the
+        canonical tokens (preserving prior behaviour).
+        """
         self.prune_expired()
         tokens_tup = tuple(tokens)
+        req_model = (
+            tuple(request_model_tokens)
+            if request_model_tokens is not None
+            else tokens_tup
+        )
 
-        # Fast path: exact-token key lookup is O(1) and avoids scanning large
-        # candidate sets in block index under multi-session workloads.
+        def _trim_to_model_depth(cache_state, entry_model_tokens, target_model_len):
+            """
+            Align cache state with `target_model_len` in model space.
+            Returns (ok, effective_depth) where `ok` signals whether the
+            cache is usable and `effective_depth` is the KV depth the caller
+            should treat as 'how many model tokens are already prefilled'.
+
+            Hybrid VLM caches (Qwen3.5_moe = ArraysCache + KVCache) are not
+            trimmable: `can_trim_prompt_cache` returns False because linear-
+            attention layers have no position-wise trim semantics.  In that
+            case we can still reuse the cache IFF the stored entry's full
+            sequence is a strict prefix of the new request's model tokens —
+            i.e. `target_model_len >= len(entry.model_tokens)` so no trim is
+            actually required.  If the new request diverges mid-way and we
+            cannot truncate, we report unusable (miss) rather than silently
+            letting stale KV past the divergence point contaminate attention.
+            """
+            current_kv = _kv_cache_offset(cache_state)
+            if current_kv is None:
+                current_kv = len(entry_model_tokens)
+            if target_model_len > current_kv:
+                # Target deeper than stored — physically impossible.
+                return False, current_kv
+            trim_amount = current_kv - target_model_len
+            if trim_amount == 0:
+                return True, current_kv
+            if can_trim_prompt_cache(cache_state):
+                trim_prompt_cache(cache_state, trim_amount)
+                return True, target_model_len
+            # Non-trimmable hybrid cache.  Stored KV is at `current_kv`;
+            # request has `target_model_len` safe tokens.  current_kv >
+            # target_model_len means the stored sequence has tokens past
+            # the common prefix — those KV positions hold attention from
+            # a diverging continuation and would poison the new request.
+            # Refuse cache reuse in this case (caller treats as miss).
+            # P4: track the hybrid-trim-miss rate.  Each bump is a cache
+            # opportunity lost because Qwen3_5Moe's ArraysCache layers
+            # aren't trimmable.  Nonzero rate in production is what
+            # justifies G4 (pre-generation prompt-only checkpoint) —
+            # without that signal, G4 would be a speculative refactor.
+            _bump_metric("hybrid_trim_miss", _current_request_id())
+            return False, current_kv
+
+        # Fast path: exact canonical-token key lookup.
         exact_key = (model, tokens_tup)
         if exact_key in self._entries:
             entry = self._extract(model, tokens_tup)
-            if len(tokens_tup) > 1 and can_trim_prompt_cache(entry.prompt_cache):
-                trim_prompt_cache(entry.prompt_cache, 1)
+            # In model space: the entry's model_tokens must be a prefix of
+            # the new request's model_tokens (or equal).  If not, the entry
+            # was built from a different model sequence sharing only a
+            # canonical prefix — unusable.
+            model_lcp = self._lcp(entry.model_tokens, req_model)
+            if model_lcp < len(entry.model_tokens):
+                # Not a safe exact reuse; try the block-hash path below.
+                # P4: nonzero rate here means two distinct model_token
+                # streams produced the SAME canonical cache key — a bug
+                # in `_canonicalize_messages` or `_scrub_cache_key` that
+                # over-normalised and merged semantically-different
+                # prompts (tracked under G6).  Should be 0 on clean paths.
+                _bump_metric(
+                    "exact_key_rejected_by_model_lcp", _current_request_id()
+                )
+            else:
+                # Full reuse: trim down to (target_model_len - 1) so the
+                # model recomputes exactly one token to kick off generation.
+                target = max(1, len(req_model) - 1)
+                ok, eff = _trim_to_model_depth(
+                    entry.prompt_cache, entry.model_tokens, target
+                )
+                if not ok:
+                    return None, list(req_model), tokens_tup, "miss", 0
+                rest = list(req_model)[eff:]
+                # P6/1c: report canonical match length WITHOUT the -1 model-
+                # space bootstrap adjustment.  `matched_prefix_len` is a
+                # canonical-space telemetry/M3 value; keeping it coherent
+                # with the block-hash path avoids a spurious off-by-one
+                # when the exact-key fast path fires instead of the block
+                # walk (e.g. on repeated identical requests).
                 return (
                     entry.prompt_cache,
-                    tokens_tup[-1:],
+                    rest,
                     tokens_tup,
                     "exact",
-                    len(tokens_tup) - 1,
+                    len(tokens_tup),
                 )
-            return entry.prompt_cache, [], tokens_tup, "exact", len(tokens_tup)
 
-        # 1. Hash the incoming request into blocks
         chain_pairs = _block_chain_hashes(tokens_tup, self.block_size)
         if not chain_pairs:
-            return None, tokens, tokens, "miss", 0
+            return None, list(req_model), tokens_tup, "miss", 0
 
-        best_prefix_len = 0
+        best_canon_prefix_len = 0
         best_cached_tokens = None
+        best_entry_model_tokens: Tuple[int, ...] = ()
+        best_model_lcp = 0
 
-        # 2. Walk blocks backwards. For each block level, collect ALL candidates
-        # that match up to that block boundary and pick the LONGEST one.
-        # Previously "first matching candidate wins" — but sets are unordered, so
-        # a short heartbeat/branch entry could win over a long conversation entry
-        # that shares the same early block hashes, causing a near-total cache flush.
+        # Walk blocks backwards, collect candidates at deepest canonical
+        # block boundary.  Among candidates at that level, pick the one with
+        # LONGEST model-space LCP — that's the safest cache reuse for the
+        # actual sequence being prefilled.
         for chain_hash, req_prefix_len in reversed(chain_pairs):
             idx_key = (model, chain_hash)
-            if idx_key in self._block_index:
-                candidate_tokens_set = self._block_index[idx_key]
-                best_candidate_at_level = None
-                best_candidate_len = -1
-                for candidate_tokens in candidate_tokens_set:
-                    if tokens_tup[:req_prefix_len] == candidate_tokens[:req_prefix_len]:
-                        if len(candidate_tokens) > best_candidate_len:
-                            best_candidate_len = len(candidate_tokens)
-                            best_candidate_at_level = candidate_tokens
-                if best_candidate_at_level is not None:
-                    best_prefix_len = req_prefix_len
-                    best_cached_tokens = best_candidate_at_level
-            if best_cached_tokens is not None:
+            if idx_key not in self._block_index:
+                continue
+            candidate_tokens_set = self._block_index[idx_key]
+            # Prefer candidates whose stored model_tokens are fully covered
+            # by the new request's model_tokens (no KV trim required).
+            # Hybrid VLM caches (ArraysCache + KVCache) cannot be trimmed —
+            # picking an entry that needs trimming would force a miss even
+            # when a shorter "prompt-only" checkpoint would have been a
+            # clean hit.  So rank candidates by (full_cover first, then
+            # longer model_lcp), not by raw model_lcp alone.
+            best_at_level = None
+            best_at_level_full_cover = False
+            best_at_level_model_lcp = -1
+            best_at_level_entry_model: Tuple[int, ...] = ()
+            for candidate_tokens in candidate_tokens_set:
+                if tokens_tup[:req_prefix_len] != candidate_tokens[:req_prefix_len]:
+                    continue
+                entry = self._entries.get((model, candidate_tokens))
+                if entry is None:
+                    continue
+                mlcp = self._lcp(entry.model_tokens, req_model)
+                if mlcp <= 0:
+                    continue
+                full_cover = mlcp >= len(entry.model_tokens)
+                better = False
+                if full_cover and not best_at_level_full_cover:
+                    better = True
+                elif full_cover == best_at_level_full_cover and mlcp > best_at_level_model_lcp:
+                    better = True
+                if better:
+                    best_at_level_full_cover = full_cover
+                    best_at_level_model_lcp = mlcp
+                    best_at_level = candidate_tokens
+                    best_at_level_entry_model = entry.model_tokens
+            if best_at_level is not None:
+                best_canon_prefix_len = req_prefix_len
+                best_cached_tokens = best_at_level
+                best_entry_model_tokens = best_at_level_entry_model
+                best_model_lcp = best_at_level_model_lcp
                 break
 
-        # 3. If no block matched, return miss
-        if best_cached_tokens is None:
-            return None, tokens, tokens, "miss", 0
+        if best_cached_tokens is None or best_model_lcp <= 0:
+            return None, list(req_model), tokens_tup, "miss", 0
 
-        # 4. Extract selected cache entry
-        entry = self._extract(model, best_cached_tokens)
-
-        # 5. Extend match inside the current block
-        while best_prefix_len < min(len(tokens_tup), len(best_cached_tokens)):
-            if tokens_tup[best_prefix_len] == best_cached_tokens[best_prefix_len]:
-                best_prefix_len += 1
+        # Extend canonical match inside the current block (kept for accurate
+        # canonical_matched_prefix_len reporting — purely telemetry).
+        while best_canon_prefix_len < min(len(tokens_tup), len(best_cached_tokens)):
+            if tokens_tup[best_canon_prefix_len] == best_cached_tokens[best_canon_prefix_len]:
+                best_canon_prefix_len += 1
             else:
                 break
 
-        # 6. Return sliced/trimmed cache
-        if best_prefix_len == len(tokens_tup):
-            # Request is fully covered by selected cache. If selected cache key is
-            # longer (prompt+completion), trim to request length first.
-            if len(best_cached_tokens) > len(tokens_tup):
-                if not can_trim_prompt_cache(entry.prompt_cache):
-                    return None, tokens, tokens, "miss", 0
-                trim_prompt_cache(
-                    entry.prompt_cache, len(best_cached_tokens) - len(tokens_tup)
-                )
-            if len(tokens_tup) > 1 and can_trim_prompt_cache(entry.prompt_cache):
+        entry = self._extract(model, best_cached_tokens)
+
+        # Prefer trimming to model-space LCP.  Cap at len(req_model) to avoid
+        # keeping KV past the new request's length (the caller would start
+        # generation from an offset past the input, corrupting state).
+        target_model_len = min(best_model_lcp, len(req_model))
+        if target_model_len <= 0:
+            return None, list(req_model), tokens_tup, "miss", 0
+
+        ok, effective_kv = _trim_to_model_depth(
+            entry.prompt_cache, best_entry_model_tokens, target_model_len
+        )
+        if not ok:
+            return None, list(req_model), tokens_tup, "miss", 0
+
+        if effective_kv == len(req_model):
+            # Full model-space cover: trim one more token so the model has
+            # something to decode from to start generation.
+            # P6/1c: `matched_prefix_len` is reported in CANONICAL space for
+            # telemetry + M3 threshold comparison.  The trim-by-1 below is
+            # in MODEL space and is an implementation detail of the decode
+            # bootstrap — do NOT subtract 1 from `best_canon_prefix_len`.
+            # Pre-P6 the trimmable branch subtracted 1 (off by canon/model
+            # delta for VLM) while the non-trimmable branch did not; the
+            # two paths now agree.
+            if (
+                len(req_model) > 1
+                and can_trim_prompt_cache(entry.prompt_cache)
+            ):
                 trim_prompt_cache(entry.prompt_cache, 1)
                 return (
                     entry.prompt_cache,
-                    tokens_tup[-1:],
+                    list(req_model)[-1:],
                     best_cached_tokens,
                     "exact",
-                    len(tokens_tup) - 1,
-                )
-            return entry.prompt_cache, [], best_cached_tokens, "exact", len(tokens_tup)
-
-        if best_prefix_len < len(tokens_tup):
-            # Shorter Match (We have the prefix, compute the rest)
-            if can_trim_prompt_cache(entry.prompt_cache):
-                trim_prompt_cache(
-                    entry.prompt_cache, len(best_cached_tokens) - best_prefix_len
+                    best_canon_prefix_len,
                 )
             return (
                 entry.prompt_cache,
-                list(tokens_tup)[best_prefix_len:],
+                [],
                 best_cached_tokens,
-                "shorter",
-                best_prefix_len,
+                "exact",
+                best_canon_prefix_len,
             )
 
-        # Longer cache: request is a strict prefix of cached; trim cache to request length
-        if can_trim_prompt_cache(entry.prompt_cache):
-            num_to_trim = len(best_cached_tokens) - len(tokens_tup)
-            trim_prompt_cache(entry.prompt_cache, num_to_trim)
-            return entry.prompt_cache, [], best_cached_tokens, "longer", len(tokens_tup)
-        return None, tokens, tokens, "miss", 0
+        # Shorter (partial) model-space cover: prefill the tail.
+        rest = list(req_model)[effective_kv:]
+        return (
+            entry.prompt_cache,
+            rest,
+            best_cached_tokens,
+            "shorter",
+            best_canon_prefix_len,
+        )
 
-    def insert_cache(self, model, tokens, prompt_cache):
+    def insert_cache(self, model, tokens, prompt_cache, model_tokens=None):
         self.prune_expired()
         tokens_tup = tuple(tokens)
+        # Default model_tokens to the canonical cache key for the LM path,
+        # where canonical == model.  VLM paths MUST pass model_tokens so the
+        # stored KV state can be correctly matched and trimmed on retrieve.
+        model_tokens_tup = (
+            tuple(model_tokens) if model_tokens is not None else tokens_tup
+        )
         key = (model, tokens_tup)
         now = time.time()
 
         if key in self._entries:
-            self._entries[key].count += 1
-            self._entries[key].touched_at = now
+            existing = self._entries[key]
+            existing.count += 1
+            existing.touched_at = now
+            # Refresh model_tokens in case a later call has more accurate
+            # information (shouldn't happen in normal flow, but defensive).
+            existing.model_tokens = model_tokens_tup
             return
 
-        # 1. Subsumption: Cull redundant prefixes to organically free up space
-        self._cull_redundant_prefixes(model, tokens_tup)
+        # 1. Subsumption: Cull redundant prefixes to organically free up space.
+        # P6/1d: pass model_tokens so the cull respects model-space distinctness,
+        # not just canonical-prefix relation (defense-in-depth against any
+        # future normalisation pass that would cross-alias distinct streams).
+        self._cull_redundant_prefixes(model, tokens_tup, model_tokens_tup)
 
         # 2. Insert into flat dictionary
-        self._entries[key] = self.CacheEntry(prompt_cache, tokens_tup, 1, now)
+        self._entries[key] = self.CacheEntry(
+            prompt_cache, tokens_tup, model_tokens_tup, 1, now
+        )
 
         # 3. Map block hashes
         chain_pairs = _block_chain_hashes(tokens_tup, self.block_size)
@@ -885,6 +1589,23 @@ class LRUPromptCache:
         if not self.contains_tokens(model, tokens):
             return None
         return self._extract(model, tuple(tokens))
+
+    def delete(self, model, tokens) -> bool:
+        """
+        Public wrapper around _delete for callers that need to evict a specific
+        entry (e.g. the VLM partial-image retreat path: the entry that produced
+        the bad cut must be removed so it does not re-win candidate selection
+        on the next request — otherwise the retreat is a starvation loop that
+        re-prefills the full context forever).
+
+        Returns True if an entry was actually deleted, False if no such key
+        existed (safe no-op — callers can invoke unconditionally).
+        """
+        key = (model, tuple(tokens))
+        if key not in self._entries:
+            return False
+        self._delete(model, tokens)
+        return True
 
 
 PROMPT_CACHE = LRUPromptCache(
@@ -1056,11 +1777,14 @@ class SessionIndex:
         prompt_tokens: List[int],
         session_ctx: SessionContext,
         prompt_cache_store: LRUPromptCache,
+        model_tokens: Optional[List[int]] = None,
     ):
         """Always use global cache; session/conversation/thread ID is ignored for lookup."""
         prompt_cache_store.prune_expired()
         self._prune_idle()
-        selected = prompt_cache_store.fetch_nearest_cache(model_name, prompt_tokens)
+        selected = prompt_cache_store.fetch_nearest_cache(
+            model_name, prompt_tokens, request_model_tokens=model_tokens
+        )
         return (*selected, "global")
 
 
@@ -1075,9 +1799,20 @@ SESSION_INDEX = SessionIndex(
 
 @dataclass
 class _SessionTurnRecord:
-    """Lightweight per-session record of the last completed turn's message structure."""
+    """
+    Lightweight per-session record of the last completed turn's message structure.
 
-    messages: List[Dict[str, Any]]  # normalised message list used for diff key
+    `canonical_messages` is the `_canonicalize_messages` output — the SAME form
+    the cache-key pipeline uses.  Storing this (rather than the original raw
+    messages) is what lets the write-guard and `_message_diff` treat OpenClaw's
+    per-turn drift (message_id, subagent Stats runtime, Inbound Context block
+    variants, timestamps, system-reminder injections) as equal — because they
+    ARE equal as far as the cache key is concerned.  Pre-G3 the guard compared
+    whitespace-stripped originals, any one drifted field froze the store and
+    the M3 stable-prefix layer stopped advancing for the rest of the session.
+    """
+
+    canonical_messages: List[Dict[str, Any]]  # canonicalized form — for diff/guard only
     msg_token_lens: List[int]  # token count for each message (in order)
     total_prompt_tokens: (
         int  # sum(msg_token_lens); equals len(prompt_tokens) for that turn
@@ -1198,7 +1933,15 @@ def _stable_prefix_token_len(
     if record is None:
         return 0, 0, []
 
-    stable_msg_count, descriptors = _message_diff(record.messages, curr_msgs)
+    # G3: diff in canonical form.  The stored record already holds canonical
+    # messages; the incoming list must be canonicalised before comparison so
+    # that OpenClaw-style per-turn drift (message_id, Stats runtime, Inbound
+    # Context variants) collapses to the same canonical sentinels and the
+    # leading block is correctly detected as stable.
+    _, canonical_curr = _canonicalize_messages(curr_msgs)
+    stable_msg_count, descriptors = _message_diff(
+        record.canonical_messages, canonical_curr
+    )
     if stable_msg_count == 0:
         return 0, 0, descriptors
 
@@ -1251,6 +1994,12 @@ def _compute_msg_token_boundaries(
                     messages[: i + 1],
                     tokenize=True,
                     add_generation_prompt=False,
+                    **(
+                        {"preserve_thinking": True}
+                        if SETTINGS.preserve_thinking
+                        and _PRESERVE_THINKING_SUPPORTED
+                        else {}
+                    ),
                 )
                 if isinstance(prefix_toks, list):
                     cur_len = len(prefix_toks)
@@ -1318,34 +2067,46 @@ def _update_session_turn_store(
         for sid in stale:
             del SESSION_TURN_STORE[sid]
 
-    # Guard: only write if the new message list is a strict append of the existing record.
-    # If the existing record's messages are NOT a prefix of the incoming list, this request
-    # is from a sub-agent or parallel branch that has a structurally different conversation
-    # history on the same session_id. Writing would clobber the orchestrator's record and
-    # corrupt the stable-prefix diff for the next orchestrator turn. Skip silently.
+    # G3: canonicalise the incoming messages BEFORE the write guard runs so
+    # that OpenClaw's per-turn drift on message_id / Stats runtime / Inbound
+    # Context block / timestamps / system-reminder injections is treated as
+    # equal — because it IS equal in canonical (cache-key) space.  Pre-G3
+    # the guard used whitespace-only normalisation, so a single drifted
+    # field froze the store for the remainder of the session and the M3
+    # stable-prefix layer stopped advancing.
+    _, canonical_curr = _canonicalize_messages(messages)
+
+    # Guard: only write if the new canonical message list is a strict append
+    # of the existing record's canonical form.  If a prior canonical message
+    # differs, this request is from a sub-agent or parallel branch with a
+    # structurally different history on the same session_id — clobbering the
+    # orchestrator's record would corrupt the next orchestrator turn's diff.
     existing = SESSION_TURN_STORE.get(session_id)
     if existing is not None:
-        prev = existing.messages
+        prev = existing.canonical_messages
         n_prev = len(prev)
-        if len(messages) < n_prev:
+        if len(canonical_curr) < n_prev:
             # Shorter than what we already have — definitely not an append. Skip.
             return
         for i in range(n_prev):
-            if prev[i].get("role") != messages[i].get(
+            if prev[i].get("role") != canonical_curr[i].get(
                 "role"
             ) or _normalize_message_content_for_diff(
                 prev[i]
-            ) != _normalize_message_content_for_diff(messages[i]):
-                # A prior message changed — this is not a linear continuation.
-                # The diff logic would still produce a valid (possibly lower) stable_prefix_count,
-                # but the stored record would now reflect a diverged branch. Skip to preserve
-                # the best-known linear record for this session.
+            ) != _normalize_message_content_for_diff(canonical_curr[i]):
+                # Canonical-form divergence — a prior message really changed
+                # semantically.  Skip to preserve the best-known linear record.
                 return
 
+    # msg_token_lens is derived from the ORIGINAL (template-prepared) messages
+    # so per-message boundaries correspond to the render the model actually
+    # sees.  The pre-existing original-vs-canonical token-count mismatch when
+    # canonicalisation collapses volatile spans is orthogonal to G3 and tracked
+    # as a P6 cleanup item.
     msg_token_lens = _compute_msg_token_boundaries(messages, prompt_tokens)
 
     SESSION_TURN_STORE[session_id] = _SessionTurnRecord(
-        messages=messages,
+        canonical_messages=canonical_curr,
         msg_token_lens=msg_token_lens,
         total_prompt_tokens=len(prompt_tokens),
         touched_at=now,
@@ -1468,6 +2229,168 @@ def _prepare_messages_for_template(messages):
 
         normalized.append(m)
     return normalized
+
+
+def _resolve_vlm_image_token_ids(config: Any) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Resolve the (image_token_id, video_token_id) that mlx-vlm's VLM forward
+    uses to match image_pad positions against pixel_values features.
+
+    Different mlx-vlm model configs use one of several key names:
+      image_token_id, image_token_index, image_pad_token_id,
+      mm_image_token_id
+    Returns (None, None) if neither is resolvable — caller must fall back to
+    a length-based heuristic.
+    """
+    if not isinstance(config, dict):
+        # Some VLM config objects are attribute-only; coerce if possible.
+        try:
+            config = dict(vars(config))
+        except Exception:
+            return None, None
+
+    def _first_int(keys: Tuple[str, ...]) -> Optional[int]:
+        for k in keys:
+            if k in config and isinstance(config[k], (int, float)):
+                try:
+                    return int(config[k])
+                except (TypeError, ValueError):
+                    continue
+        # Fall back into nested `text_config` / `vision_config` (Qwen2_VL etc.)
+        for nested in ("text_config", "vision_config", "config"):
+            sub = config.get(nested)
+            if isinstance(sub, dict):
+                for k in keys:
+                    if k in sub and isinstance(sub[k], (int, float)):
+                        try:
+                            return int(sub[k])
+                        except (TypeError, ValueError):
+                            continue
+        return None
+
+    image_id = _first_int((
+        "image_token_id",
+        "image_token_index",
+        "image_pad_token_id",
+        "mm_image_token_id",
+    ))
+    video_id = _first_int((
+        "video_token_id",
+        "video_token_index",
+        "video_pad_token_id",
+    ))
+    return image_id, video_id
+
+
+# Resolved once at startup (after model load) — may be None for text-only LM.
+VLM_IMAGE_TOKEN_ID: Optional[int] = None
+VLM_VIDEO_TOKEN_ID: Optional[int] = None
+
+
+# --- G1: image-identity cache-key correctness ---
+# The canonical cache key for VLM encodes each image placeholder as a single
+# `<|image_pad|>` token (the text tokeniser does not expand to per-feature
+# tokens — only mlx-vlm's prepare_inputs does, on the model path).  Two
+# requests that share message structure but carry DIFFERENT images therefore
+# produce IDENTICAL canonical token streams.  The block-hash index and
+# model-space LCP then accept image-A's cached KV for image-B's request and
+# silently serve wrong answers (see .context/LESSONS.md and GOALS.md G1).
+#
+# Fix: inject a deterministic 2-token marker per image into the canonical
+# token stream right after each `<|image_pad|>` position, in message order.
+# Markers live in a reserved id range (`_IMG_MARKER_BASE`..`_IMG_MARKER_MASK`)
+# above any real tokenizer vocab and safely inside uint32 for the block-hash
+# chain.  They ONLY appear in canonical cache-key tokens; `model_tokens` and
+# the model's view are untouched — the dual-pipeline invariant is preserved.
+_IMG_MARKER_BASE: int = 0x7F00_0000  # 2_130_706_432 — above any real vocab
+_IMG_MARKER_MASK: int = 0x00FF_FFFF  # 24 bits of hash per synthetic token
+
+
+def _image_identity_markers(images: List[Any]) -> List[List[int]]:
+    """
+    Compute a stable 2-token marker per image for the canonical cache key.
+
+    Hashing strategy by source type:
+    - PIL Image: SHA-256 of raw pixel bytes + size tuple.
+    - data URL ("data:image/..;base64,..."): SHA-256 of the decoded payload.
+    - bare URL string (http/file/s3/etc.): SHA-256 of the URL string itself
+      (the best we can do without fetching; collisions imply identical URLs
+      which are intended to match).
+
+    Each returned marker is two uint32 tokens in the reserved range; combined
+    they carry 48 bits of entropy (collision probability ≈ 3.6e-15 between
+    any two images, which is orders of magnitude below the rest of the
+    correctness envelope).
+
+    Never raises — on any parse/hash failure the marker degrades to a stable
+    placeholder so the cache key stays deterministic instead of diverging.
+    """
+    import base64
+
+    out: List[List[int]] = []
+    for src in images:
+        try:
+            if hasattr(src, "tobytes") and hasattr(src, "size"):
+                raw = src.tobytes() + repr(getattr(src, "size", ())).encode("utf-8")
+                digest = hashlib.sha256(raw).digest()
+            elif isinstance(src, str):
+                if src.startswith("data:") and "," in src:
+                    _, b64 = src.split(",", 1)
+                    try:
+                        raw = base64.b64decode(b64)
+                    except Exception:
+                        raw = src.encode("utf-8")
+                    digest = hashlib.sha256(raw).digest()
+                else:
+                    digest = hashlib.sha256(src.encode("utf-8")).digest()
+            else:
+                digest = hashlib.sha256(repr(src).encode("utf-8")).digest()
+        except Exception:
+            digest = hashlib.sha256(b"__img_hash_failed__").digest()
+        d = int.from_bytes(digest[:6], "big")  # 48 bits
+        t0 = _IMG_MARKER_BASE | (d & _IMG_MARKER_MASK)
+        t1 = _IMG_MARKER_BASE | ((d >> 24) & _IMG_MARKER_MASK)
+        out.append([t0, t1])
+    return out
+
+
+def _inject_image_markers(
+    canon_ids: List[int],
+    markers: List[List[int]],
+    pad_id: int,
+) -> List[int]:
+    """
+    Append each marker to `canon_ids` immediately after the contiguous run of
+    `pad_id` tokens that corresponds to the i-th image, in order.
+
+    Text-only tokenisation normally collapses each `<|image_pad|>` placeholder
+    into a single token, but contiguous runs are tolerated for robustness
+    against template variants.  If pad runs and markers have different counts
+    we inject up to `min(len)` and leave the rest untouched — degraded but
+    still deterministic (consistency across turns is what matters for cache
+    lookup).
+    """
+    if not markers or not canon_ids:
+        return list(canon_ids)
+    out: List[int] = []
+    n = len(canon_ids)
+    i = 0
+    m_idx = 0
+    while i < n:
+        tok = canon_ids[i]
+        if tok == pad_id and m_idx < len(markers):
+            # Absorb the full contiguous pad run, then emit the marker.
+            j = i
+            while j < n and canon_ids[j] == pad_id:
+                out.append(canon_ids[j])
+                j += 1
+            out.extend(markers[m_idx])
+            m_idx += 1
+            i = j
+            continue
+        out.append(tok)
+        i += 1
+    return out
 
 
 def _messages_have_images(messages: List[Dict[str, Any]]) -> bool:
@@ -1695,6 +2618,75 @@ def _should_enable_thinking(body):
         return body["enable_thinking"]
     # Default to enabled
     return SETTINGS.default_thinking
+
+
+# P6/1e: resolved once at startup via `_probe_preserve_thinking_support`.
+# None = probe hasn't run yet (open to either) — effectively True on first call.
+# After probe: concrete True / False.
+_PRESERVE_THINKING_SUPPORTED: Optional[bool] = None
+
+
+def _probe_preserve_thinking_support(targets: List[Any]) -> bool:
+    """
+    P6/1e: determine whether `preserve_thinking` can be forwarded to the
+    active tokenizer/processor's `apply_chat_template` without raising.
+    HuggingFace tokenizers generally accept unknown Jinja-context kwargs,
+    but `ProcessorMixin.apply_chat_template` signatures vary — a future
+    mlx-vlm / transformers upgrade with stricter kwarg checking would
+    TypeError every request.  Probing once at startup (after model load)
+    and caching the result means zero per-request cost and a defensive
+    posture.
+
+    All targets must accept the kwarg for us to return True; if ANY one
+    rejects it we disable forwarding everywhere (the render paths for
+    cache-key and model-input must stay consistent).
+
+    Probe payload is intentionally minimal (one short user message) so
+    template rendering cost is trivial.  Exceptions during the probe
+    fall through to False (safer — no forward means today's behaviour
+    without the kwarg, which is what the pre-P2 server shipped).
+    """
+    probe_msgs = [{"role": "user", "content": "probe"}]
+    for target in targets:
+        if target is None:
+            continue
+        fn = getattr(target, "apply_chat_template", None)
+        chat_tpl = getattr(target, "chat_template", None)
+        if fn is None or chat_tpl is None:
+            # No template available on this target — can't probe; assume
+            # not supported to stay on the safe side for its paths.
+            return False
+        try:
+            fn(probe_msgs, tokenize=False, add_generation_prompt=False,
+               preserve_thinking=True)
+        except TypeError:
+            return False
+        except Exception:
+            # Non-kwarg error (e.g. template doesn't handle empty context) —
+            # assume kwarg itself is fine; errors unrelated to preserve_thinking
+            # will surface on real requests anyway.
+            pass
+    return True
+
+
+def _chat_template_extras(enable_thinking: Optional[bool]) -> Dict[str, Any]:
+    """
+    Build kwargs common to every apply_chat_template call so cache-key path and model-input
+    path render identically. `preserve_thinking` keeps prior assistant <think>...</think>
+    blocks in the history (critical for Qwen3.6). Templates that don't reference the flag
+    ignore it; see chat_template.jinja `{% if preserve_thinking is defined ... %}`.
+
+    P6/1e: only forward `preserve_thinking` when the startup probe confirmed
+    the active tokenizer/processor accepts the kwarg.  Pre-P6 this was
+    forwarded unconditionally and a stricter-kwarg transformers upgrade
+    would break every request.
+    """
+    extras: Dict[str, Any] = {}
+    if enable_thinking is not None:
+        extras["enable_thinking"] = enable_thinking
+    if SETTINGS.preserve_thinking and _PRESERVE_THINKING_SUPPORTED:
+        extras["preserve_thinking"] = True
+    return extras
 
 
 def _reasoning_level_to_enable_thinking(value: Any) -> Optional[bool]:
@@ -1936,6 +2928,7 @@ def _insert_cache_entries(
     prompt_cache: Any,
     generated_tokens: List[int],
     tool_calls: Optional[List[Dict[str, Any]]] = None,
+    prompt_model_tokens: Optional[List[int]] = None,
 ) -> None:
     """
     Insert the standard full-turn cache entry and, for tool-call or VLM turns,
@@ -1943,12 +2936,26 @@ def _insert_cache_entries(
     reuse when provider-side tool-call serialisation differs between turns, or
     when VLM vision tokens change the effective prompt boundary.
 
+    `prompt_model_tokens` is the MODEL-space token sequence (pre-generation)
+    that actually built the KV state.  For VLM, this includes image-pad token
+    expansion and differs from the canonical `cache_key`.  For LM paths,
+    `prompt_model_tokens` defaults to the pre-generation canonical prefix.
+
     For plain LM turns without tool calls the full-key entry alone is sufficient:
     the next request will get a 'shorter' hit via _cull_redundant_prefixes or
     trim, without requiring a second deepcopy here. Gating the deepcopy prevents
     two full KV tensors (~2–3 GB each at 20k tokens) from living simultaneously
     in GPU memory on every non-tool turn.
     """
+    gen_len = len(generated_tokens or [])
+    canonical_prompt_len = max(0, len(cache_key) - gen_len)
+    if prompt_model_tokens is None:
+        prompt_model_tokens_list = list(cache_key[:canonical_prompt_len])
+    else:
+        prompt_model_tokens_list = list(prompt_model_tokens)
+    # Full-turn model tokens = prompt model tokens + generated tokens.
+    model_tokens_full = prompt_model_tokens_list + list(generated_tokens or [])
+
     # Only insert a prompt-only checkpoint for turns where it actually helps:
     # - tool_calls: next turn's prompt differs from cache key due to serialisation
     # - is_vlm: VLM requests need an explicit prefix entry for vision-token reuse
@@ -1963,31 +2970,84 @@ def _insert_cache_entries(
             prompt_only_cache = copy.deepcopy(prompt_cache)
             trim_prompt_cache(prompt_only_cache, len(generated_tokens))
             prompt_only_key = cache_key[: -len(generated_tokens)]
-            PROMPT_CACHE.insert_cache(model_name, prompt_only_key, prompt_only_cache)
+            PROMPT_CACHE.insert_cache(
+                model_name,
+                prompt_only_key,
+                prompt_only_cache,
+                model_tokens=prompt_model_tokens_list,
+            )
             SESSION_INDEX.register_cache_key(session_ctx, prompt_only_key)
         except Exception:
             pass
 
-    PROMPT_CACHE.insert_cache(model_name, cache_key, prompt_cache)
+    PROMPT_CACHE.insert_cache(
+        model_name, cache_key, prompt_cache, model_tokens=model_tokens_full
+    )
     SESSION_INDEX.register_cache_key(session_ctx, cache_key)
+
+
+def _vlm_cache_covers_partial_image(
+    model_tokens: List[int], rest_tokens: List[int]
+) -> Tuple[bool, int, int]:
+    """
+    True if the current cache cut leaves rest_tokens with a partial span of
+    image-pad tokens (some but not all).  mlx-vlm's VLM forward demands that
+    the count of image_pad tokens in input_ids exactly equals the total
+    features in pixel_values — otherwise it raises:
+
+        Image features and image tokens do not match: tokens: N, features M
+
+    Callers use the bool to decide whether to retreat to a fresh prefill.
+    Returns (is_partial, full_pad_count, rest_pad_count) so callers can log it.
+
+    When the model has no resolvable image token id (mixed-arch VLMs), this
+    function reports no partial — the _stream_generate_unified fallback
+    handles those conservatively (use_vision only on cold miss).
+    """
+    if VLM_IMAGE_TOKEN_ID is None and VLM_VIDEO_TOKEN_ID is None:
+        return False, 0, 0
+    pad_ids = set()
+    if VLM_IMAGE_TOKEN_ID is not None:
+        pad_ids.add(int(VLM_IMAGE_TOKEN_ID))
+    if VLM_VIDEO_TOKEN_ID is not None:
+        pad_ids.add(int(VLM_VIDEO_TOKEN_ID))
+    full_count = sum(1 for t in model_tokens if int(t) in pad_ids)
+    if full_count == 0:
+        return False, 0, 0
+    rest_count = sum(1 for t in rest_tokens if int(t) in pad_ids)
+    cached_pads = full_count - rest_count
+    is_partial = 0 < cached_pads < full_count
+    return is_partial, full_count, rest_count
 
 
 def _kv_cache_offset(cache: Any) -> Optional[int]:
     """
     Return the current KV offset (number of original tokens actually stored in the
-    KV cache) from the first cache layer after any trim_prompt_cache() call.
+    KV cache) after any trim_prompt_cache() call.
 
-    KVCache and QuantizedKVCache both expose a public `.offset` int attribute
-    (mlx_lm/models/cache.py).  `prompt_cache` is a list of per-layer caches.
+    KVCache / QuantizedKVCache / RotatingKVCache all expose an int `.offset`.
+    Hybrid VLM models (e.g. Qwen3.6 Qwen3_5MoeForConditionalGeneration) mix
+    attention layers with linear/mamba layers that use ArraysCache, which has NO
+    `.offset`.  In that case we must scan the layers for the first attention
+    cache that does expose an integer offset — using layer[0] blindly would read
+    an ArraysCache and return None, forcing the caller to fall back to the
+    canonical matched_prefix_len (which is in canonical-token space, NOT model-
+    token space, and lands mid image-pad expansion on VLM turns with images).
 
-    Returns None if the cache is None, empty, or does not expose .offset.
-    Callers must fall back to the canonical `matched_prefix_len` in that case.
+    Returns None only when NO layer exposes a usable offset.
     """
-    try:
-        layer = cache[0] if isinstance(cache, (list, tuple)) else cache
-        return int(layer.offset)
-    except (IndexError, TypeError, AttributeError):
+    if cache is None:
         return None
+    layers = cache if isinstance(cache, (list, tuple)) else [cache]
+    for layer in layers:
+        off = getattr(layer, "offset", None)
+        if off is None:
+            continue
+        try:
+            return int(off)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _assert_cache_key_safety(
@@ -2587,6 +3647,17 @@ if _config and _is_vlm_config(_config):
     if vlm_config is None and hasattr(model, "config"):
         vlm_config = getattr(model.config, "__dict__", None) or {}
     _terminal_status("✅", "VLM model loaded (mlx-vlm).")
+    # Resolve the model's image / video pad token IDs once, after config is loaded.
+    # Used by _stream_generate_unified to decide (safely) whether rest_tokens
+    # still contains image placeholders that need pixel_values, and by the VLM
+    # cache safety check to detect mid-image cache cuts.
+    VLM_IMAGE_TOKEN_ID, VLM_VIDEO_TOKEN_ID = _resolve_vlm_image_token_ids(
+        vlm_config if isinstance(vlm_config, dict) else (_config or {})
+    )
+    _terminal_status(
+        "🖼️",
+        f"VLM image_token_id={VLM_IMAGE_TOKEN_ID} video_token_id={VLM_VIDEO_TOKEN_ID}",
+    )
     try:
         from transformers.utils import is_torchvision_available
 
@@ -2611,6 +3682,30 @@ else:
     )
     _terminal_status("✅", "Model loaded (mlx-lm).")
     _terminal_status("⚡", "Torch acceleration: N/A (text-only model).")
+
+# P6/1e: probe whether `preserve_thinking` can be forwarded to the active
+# tokenizer / processor's `apply_chat_template`.  Done once, here, after
+# model load so both LM and VLM target sets are populated.  Result caches
+# in `_PRESERVE_THINKING_SUPPORTED`; `_chat_template_extras` only forwards
+# the kwarg when True.  Guards against a future transformers / mlx-vlm
+# upgrade that tightens kwarg checking — pre-P6 forwarded unconditionally
+# and would TypeError every request after such an upgrade.
+_probe_targets = [tokenizer]
+if is_vlm and processor is not None:
+    _probe_targets.append(processor)
+    _maybe_proc_tok = getattr(processor, "tokenizer", None)
+    if _maybe_proc_tok is not None and _maybe_proc_tok is not tokenizer:
+        _probe_targets.append(_maybe_proc_tok)
+try:
+    _PRESERVE_THINKING_SUPPORTED = _probe_preserve_thinking_support(_probe_targets)
+except Exception:
+    _PRESERVE_THINKING_SUPPORTED = False
+_terminal_status(
+    "🧵",
+    f"preserve_thinking probe: "
+    f"{'supported' if _PRESERVE_THINKING_SUPPORTED else 'NOT supported — kwarg will not be forwarded'}",
+)
+
 _terminal_status(
     "🧠",
     (
@@ -2660,20 +3755,33 @@ def _stream_generate_unified(
     Dynamically checks for image tokens in rest_tokens to prevent Metal Segmentation Faults.
     """
     if is_vlm:
-        # Prevent Segfault: We MUST pass vision tensors if rest_tokens contains image placeholders.
-        # If we have a massive chunk of rest_tokens (e.g., > 100) on a 'shorter' hit,
-        # it almost certainly contains the system/user image tokens.
-        has_image_tokens = False
-        if rest_tokens:
-            # Check for common Qwen3/GLM vision token IDs, or fallback to length heuristic
-            vision_tokens = {151652, 151653, 151654, 151655}  # Common Qwen vision IDs
-            has_image_tokens = any(tok in vision_tokens for tok in rest_tokens)
-            if not has_image_tokens and len(rest_tokens) > 100:
-                has_image_tokens = True
+        # Pass vision tensors ONLY when rest_tokens still contains image_pad
+        # placeholders that mlx-vlm needs to fill with image embeddings.  If
+        # the cache already covers the image span, rest_tokens has zero image
+        # pads and pixel_values MUST be None — otherwise mlx-vlm's safety
+        # check raises "Image features and image tokens do not match:
+        # tokens: N, features M" when N != full image feature count.
+        image_pad_ids = set()
+        if VLM_IMAGE_TOKEN_ID is not None:
+            image_pad_ids.add(int(VLM_IMAGE_TOKEN_ID))
+        if VLM_VIDEO_TOKEN_ID is not None:
+            image_pad_ids.add(int(VLM_VIDEO_TOKEN_ID))
 
-        use_vision = (
-            cache_match_type == "miss" or has_image_tokens
-        ) and vlm_pixel_values is not None
+        rest_image_pad_count = 0
+        if rest_tokens and image_pad_ids:
+            rest_image_pad_count = sum(
+                1 for tok in rest_tokens if int(tok) in image_pad_ids
+            )
+        # Fallback for unknown VLMs: be conservative — on a cold miss, pass
+        # pixel_values; on any cache hit, trust that the prior turn's KV
+        # already absorbed the image and skip pixel_values.
+        if not image_pad_ids:
+            has_image_tokens_fallback = cache_match_type == "miss"
+            use_vision = has_image_tokens_fallback and vlm_pixel_values is not None
+        else:
+            use_vision = (
+                rest_image_pad_count > 0 and vlm_pixel_values is not None
+            )
 
         rest_ids = (
             mx.array([rest_tokens], dtype=mx.int32)
@@ -2717,7 +3825,21 @@ class APIHandler(BaseHTTPRequestHandler):
         # Keep terminal output focused on custom request lifecycle lines.
         return
 
+    def _mark_connection_close(self) -> None:
+        # Single-threaded HTTPServer (see run()): HTTP/1.1 keep-alive lets one
+        # client (e.g. LiteLLM's connection pool) block every other client
+        # forever because handle_one_request() loops on the same socket until
+        # the peer closes.  Forcing close after every response keeps the
+        # single-threaded accept loop fair — each request is served on its own
+        # connection without starving anyone.
+        try:
+            self.close_connection = True
+        except Exception:
+            pass
+
     def do_GET(self):
+        self._mark_connection_close()
+
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2741,12 +3863,14 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Not Found")
 
     def do_POST(self):
+        self._mark_connection_close()
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             return self.do_GET()
 
         if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
             self.send_error(404, "Not Found")
             return
+
 
         try:
             content_length = int(self.headers["Content-Length"])
@@ -2756,6 +3880,11 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         request_id = uuid.uuid4().hex[:12]
+        # P4: publish request_id to thread-local so cache-layer bump sites
+        # (inside LRUPromptCache, inside `_trim_to_model_depth`) can
+        # attribute to this request without threading request_id through
+        # every internal call.  Cleared in the outer finally.
+        _set_current_request_id(request_id)
         tools = body.get("tools")
         reasoning_control = _extract_enable_thinking(body)
         enable_thinking = reasoning_control["enable_thinking"]
@@ -2782,6 +3911,11 @@ class APIHandler(BaseHTTPRequestHandler):
                         images,
                         tools=tools,
                         enable_thinking=enable_thinking,
+                        **{
+                            k: v
+                            for k, v in _chat_template_extras(enable_thinking).items()
+                            if k != "enable_thinking"
+                        },
                     )
                 )
                 _vlm_sync_before_generation(vlm_pixel_values, vlm_mask)
@@ -2830,11 +3964,32 @@ class APIHandler(BaseHTTPRequestHandler):
                             tokenize=False,
                             add_generation_prompt=True,
                             tools=tools,
-                            enable_thinking=enable_thinking,
+                            **_chat_template_extras(enable_thinking),
                         )
                         _canon_fmt = _scrub_cache_key(str(_canon_fmt))
                         _canon_ids = _vlm_tok.encode(_canon_fmt)
                         if isinstance(_canon_ids, list) and _canon_ids:
+                            # G1: make canonical cache key image-content
+                            # aware.  Without this, `<|image_pad|>` is a
+                            # single token that encodes identically for any
+                            # image payload — two requests with the same
+                            # message structure but different images
+                            # produce byte-identical canonical keys and
+                            # silently reuse each other's KV attention.
+                            # Markers live in canonical space ONLY; the
+                            # model path (model_tokens) is untouched.
+                            if (
+                                SETTINGS.cache_vlm_image_identity
+                                and VLM_IMAGE_TOKEN_ID is not None
+                                and images
+                            ):
+                                _img_markers = _image_identity_markers(images)
+                                if _img_markers:
+                                    _canon_ids = _inject_image_markers(
+                                        _canon_ids,
+                                        _img_markers,
+                                        int(VLM_IMAGE_TOKEN_ID),
+                                    )
                             prompt_tokens = _canon_ids
                 except Exception:
                     pass  # Fall back to model_tokens — correct but no canonicalization
@@ -2861,14 +4016,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     tokenize=False,
                     add_generation_prompt=True,
                     tools=tools,
-                    enable_thinking=enable_thinking,
+                    **_chat_template_extras(enable_thinking),
                 )
                 cache_prompt_raw = tokenizer.apply_chat_template(
                     cache_messages,
                     tokenize=False,
                     add_generation_prompt=True,
                     tools=tools,
-                    enable_thinking=enable_thinking,
+                    **_chat_template_extras(enable_thinking),
                 )
             else:
                 prompt = messages[-1]["content"] if messages else ""
@@ -2933,12 +4088,30 @@ class APIHandler(BaseHTTPRequestHandler):
         stable_prefix_msg_count_computed = 0
         stable_prefix_diff_descriptors: List[Dict[str, Any]] = []
 
+        # --- G2 WATCHDOG STATE ---
+        # Cooperative abort flag.  Set by a threading.Timer after
+        # `generation_watchdog_seconds` of active generation to recover
+        # `model_lock` from pathological decodes / stalls.  Yield loops
+        # check is_set() after each token; finally cancels the timer.
+        watchdog_flag = threading.Event()
+        watchdog_timer: Optional[threading.Timer] = None
+        generation_aborted = False
+
         try:
             model_lock.acquire(blocking=True)
             acquired = True
 
             generation_started_at = time.time()
             wait_seconds = generation_started_at - queue_started_at
+
+            # Start the wall-clock deadline AFTER lock acquire so queue-wait
+            # does not consume the generation budget.  A value of 0 disables
+            # the watchdog (legacy behaviour — unbounded generation).
+            _wd_s = SETTINGS.generation_watchdog_seconds
+            if _wd_s and _wd_s > 0:
+                watchdog_timer = threading.Timer(float(_wd_s), watchdog_flag.set)
+                watchdog_timer.daemon = True
+                watchdog_timer.start()
             with prompt_cache_lock:
                 # --- M2: Compute stable prefix from message-level diff ---
                 _session_id_for_turn = (session_ctx.session_id or "").strip()
@@ -2950,11 +4123,18 @@ class APIHandler(BaseHTTPRequestHandler):
                     ) = _stable_prefix_token_len(_session_id_for_turn, messages)
 
                 # --- Standard global cache lookup ---
-                # Cache lookup operates on prompt_tokens (canonical key).
-                # rest_tokens will be overridden below to use model_tokens (original).
+                # Cache lookup uses the canonical `prompt_tokens` for block-
+                # hash candidate discovery AND the original `model_tokens`
+                # for model-space LCP verification + KV trim.  The returned
+                # `rest_model_tokens` is already sliced to the tail of
+                # `model_tokens` that still needs prefilling — no post-hoc
+                # math against _kv_cache_offset needed.  This is the
+                # dual-pipeline correctness guarantee for VLM: canonical
+                # prefix collisions (e.g. system-prompt reuse) cannot yield
+                # KV states built from a different image-expansion sequence.
                 (
                     prompt_cache,
-                    _rest_tokens_canonical,
+                    rest_model_tokens,
                     cache_session_tokens,
                     cache_match_type,
                     matched_prefix_len,
@@ -2964,15 +4144,65 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt_tokens=prompt_tokens,
                     session_ctx=session_ctx,
                     prompt_cache_store=PROMPT_CACHE,
+                    model_tokens=model_tokens,
                 )
-                # Model always prefills from original tokens (dual-pipeline invariant).
-                # Use the actual KV cache offset (number of original tokens stored)
-                # rather than matched_prefix_len (which is a canonical token count and
-                # may differ when _canonicalize_messages() changes token lengths).
+                rest_tokens = (
+                    rest_model_tokens
+                    if rest_model_tokens is not None
+                    else list(model_tokens)
+                )
                 _kv_off = _kv_cache_offset(prompt_cache)
-                rest_tokens = model_tokens[
-                    _kv_off if _kv_off is not None else matched_prefix_len :
-                ]
+
+                # Defensive VLM safety net: if LCP somehow landed mid-image
+                # (same image-pad token id across turns but e.g. a missing
+                # gen-tokens storage path), mlx-vlm's forward would raise
+                # "Image features and image tokens do not match".  Retreat to
+                # a fresh prefill rather than crash the request.
+                if is_vlm and prompt_cache is not None:
+                    _is_partial, _full_pads, _rest_pads = (
+                        _vlm_cache_covers_partial_image(model_tokens, rest_tokens)
+                    )
+                    if _is_partial:
+                        if SETTINGS.vlm_cache_debug:
+                            _terminal_status(
+                                "🛟",
+                                f"[vlm-cache-retreat] cache cut mid-image "
+                                f"(full_pads={_full_pads} rest_pads={_rest_pads}) — "
+                                "dropping cache and prefilling fresh to satisfy mlx-vlm "
+                                "image-feature parity.",
+                                indent=1,
+                            )
+                        # 1a: evict the offending entry so it does not
+                        # re-win candidate selection next turn and trap us
+                        # in a retreat-forever starvation loop.
+                        try:
+                            if cache_session_tokens:
+                                PROMPT_CACHE.delete(
+                                    SETTINGS.model_path, cache_session_tokens
+                                )
+                        except Exception:
+                            pass
+                        # P4: track G1 effectiveness.  With G1 active this
+                        # should never fire on clean traffic.  Any bump is
+                        # a signal that G1's marker injection missed a
+                        # canonical-collision case.
+                        _bump_metric("vlm_retreat", request_id)
+                        prompt_cache = None
+                        rest_tokens = list(model_tokens)
+                        cache_match_type = "miss"
+                        matched_prefix_len = 0
+                        cache_selection_source = "vlm_retreat"
+                        _kv_off = None
+
+                if SETTINGS.vlm_cache_debug and prompt_cache is not None:
+                    _terminal_status(
+                        "🔬",
+                        f"[cache-diag] match={cache_match_type} mpl={matched_prefix_len} "
+                        f"kv_off={_kv_off} model_len={len(model_tokens)} "
+                        f"canon_len={len(prompt_tokens)} delta={len(model_tokens)-len(prompt_tokens)} "
+                        f"rest={len(rest_tokens)} layer_type={type(prompt_cache[0]).__name__ if prompt_cache else 'None'}",
+                        indent=1,
+                    )
 
                 # --- M3: Stable-prefix fallback ---
                 # If the global cache lookup found fewer cached tokens than the
@@ -2989,62 +4219,78 @@ class APIHandler(BaseHTTPRequestHandler):
                     stable_prefix_toks = prompt_tokens[
                         :stable_prefix_token_len_computed
                     ]
+                    # Also scope the stable-prefix lookup to the request's
+                    # model_tokens so any candidate that shares the canonical
+                    # prefix but differs in model space (e.g. different image
+                    # expansion) is rejected instead of silently producing a
+                    # bad KV reuse.
                     (
                         sp_cache,
-                        _sp_rest_tokens_canonical,
+                        sp_rest_model_tokens,
                         sp_cache_session_tokens,
                         sp_match_type,
                         sp_matched_prefix_len,
                     ) = PROMPT_CACHE.fetch_nearest_cache(
-                        SETTINGS.model_path, stable_prefix_toks
+                        SETTINGS.model_path,
+                        stable_prefix_toks,
+                        request_model_tokens=model_tokens,
                     )
                     if (
                         sp_cache is not None
                         and sp_matched_prefix_len > matched_prefix_len
                     ):
-                        # The stable-prefix lookup gives a better hit.
-                        # Trim the cache to the stable prefix boundary and re-prefill the rest.
-                        if sp_matched_prefix_len < stable_prefix_token_len_computed:
-                            # Partial hit on the stable prefix: still better than before
-                            trim_amount = (
-                                len(stable_prefix_toks) - sp_matched_prefix_len
-                            )
-                            if trim_amount > 0 and can_trim_prompt_cache(sp_cache):
-                                trim_prompt_cache(sp_cache, trim_amount)
-                            # Model prefills from original tokens starting at the actual
-                            # KV offset (not the canonical sp_matched_prefix_len).
-                            _sp_kv_off = _kv_cache_offset(sp_cache)
-                            rest_tokens = model_tokens[
-                                _sp_kv_off
-                                if _sp_kv_off is not None
-                                else sp_matched_prefix_len :
-                            ]
-                        else:
-                            # Full stable-prefix hit: re-prefill only the new suffix
-                            # Trim the cache back to exactly stable_prefix_token_len_computed
-                            # (sp_matched_prefix_len may be > stable_prefix_token_len_computed
-                            # if the cache also covers some new tokens — that's fine, trim to SP boundary)
-                            if sp_matched_prefix_len > stable_prefix_token_len_computed:
-                                trim_amount = (
-                                    sp_matched_prefix_len
-                                    - stable_prefix_token_len_computed
-                                )
-                                if can_trim_prompt_cache(sp_cache):
-                                    trim_prompt_cache(sp_cache, trim_amount)
-                                sp_matched_prefix_len = stable_prefix_token_len_computed
-                            # Model prefills from original tokens starting at the actual
-                            # KV offset (not the canonical sp_matched_prefix_len).
-                            _sp_kv_off = _kv_cache_offset(sp_cache)
-                            rest_tokens = model_tokens[
-                                _sp_kv_off
-                                if _sp_kv_off is not None
-                                else sp_matched_prefix_len :
-                            ]
+                        # fetch_nearest_cache already trimmed sp_cache in
+                        # model space via LCP(entry.model_tokens,
+                        # request model_tokens), so sp_rest_model_tokens is
+                        # the correct tail to prefill.  No further canonical
+                        # trim math here — that was the VLM mis-slice bug.
+                        rest_tokens = (
+                            sp_rest_model_tokens
+                            if sp_rest_model_tokens is not None
+                            else list(model_tokens)
+                        )
                         prompt_cache = sp_cache
                         cache_session_tokens = sp_cache_session_tokens
                         matched_prefix_len = sp_matched_prefix_len
                         cache_match_type = "stable_prefix_" + sp_match_type
                         cache_selection_source = "stable_prefix"
+
+                        # Defensive VLM safety net (same rationale as the
+                        # primary lookup path — the new fetch should never
+                        # leave a partial image, but guard in case a future
+                        # tokenizer change sneaks past LCP).
+                        if is_vlm:
+                            _is_partial, _full_pads, _rest_pads = (
+                                _vlm_cache_covers_partial_image(
+                                    model_tokens, rest_tokens
+                                )
+                            )
+                            if _is_partial:
+                                if SETTINGS.vlm_cache_debug:
+                                    _terminal_status(
+                                        "🛟",
+                                        f"[vlm-cache-retreat] stable-prefix cut mid-image "
+                                        f"(full_pads={_full_pads} rest_pads={_rest_pads}) — "
+                                        "dropping cache and prefilling fresh.",
+                                        indent=1,
+                                    )
+                                # 1a: evict the offending stable-prefix
+                                # entry for the same reason as the primary
+                                # retreat path — break the loop.
+                                try:
+                                    if cache_session_tokens:
+                                        PROMPT_CACHE.delete(
+                                            SETTINGS.model_path, cache_session_tokens
+                                        )
+                                except Exception:
+                                    pass
+                                # P4: same rationale as primary retreat.
+                                _bump_metric("vlm_retreat", request_id)
+                                prompt_cache = None
+                                rest_tokens = list(model_tokens)
+                                cache_match_type = "miss"
+                                matched_prefix_len = 0
+                                cache_selection_source = "vlm_retreat"
 
             # --- DEBUG BLOCK ---
             # Only fire when the cache divergence is genuinely unexpected:
@@ -3128,6 +4374,11 @@ class APIHandler(BaseHTTPRequestHandler):
                             "stable_prefix_diff": stable_prefix_diff_descriptors[
                                 :8
                             ],  # cap to avoid log bloat
+                            # --- P4: cache-correctness metrics ---
+                            "cache_metrics_snapshot": _metrics_snapshot(),
+                            "cache_metrics_bumped_this_request": _metrics_drain_request(
+                                request_id
+                            ),
                             **(
                                 {
                                     "vlm_format_prefix_stable": getattr(
@@ -3210,6 +4461,22 @@ class APIHandler(BaseHTTPRequestHandler):
                             f"Request {request_id} in progress | generated_tokens={len(generated_tokens)}",
                             indent=1,
                         )
+                    # G2: cooperative abort between tokens.  If the watchdog
+                    # fired we break now — partial KV state is NOT cached
+                    # (see the gated _insert_cache_entries / session-turn /
+                    # healing-store blocks below) so next-turn correctness
+                    # is preserved; the client receives whatever generated
+                    # so far with finish_reason="length".
+                    if watchdog_flag.is_set():
+                        generation_aborted = True
+                        _terminal_status(
+                            "⏱️",
+                            f"Request {request_id} aborted by watchdog "
+                            f"after {SETTINGS.generation_watchdog_seconds}s "
+                            f"| partial_tokens={len(generated_tokens)}",
+                            indent=1,
+                        )
+                        break
                 response_text = "".join(generated_parts)
                 raw_response_text = response_text
                 response_text = _normalize_assistant_text(
@@ -3222,8 +4489,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
 
-                    # --- NEW HEALING STORE LOGIC ---
-                    if raw_response_text != message_text:
+                    # --- HEALING STORE LOGIC ---
+                    # Skip on abort: hashing partial output would let a
+                    # client retry (same partial text → same hash) resurrect
+                    # a truncated response from a different request.
+                    if raw_response_text != message_text and not generation_aborted:
                         h = _get_healing_hash(message_text, tool_calls)
                         if h:
                             with HEALING_STORE_LOCK:
@@ -3232,26 +4502,58 @@ class APIHandler(BaseHTTPRequestHandler):
                                 while len(HEALING_STORE) > MAX_HEALING_STORE:
                                     HEALING_STORE.popitem(last=False)
 
-                finish_reason = "tool_calls" if tool_calls else "stop"
+                # G2: if aborted, force finish_reason=length (OpenAI standard
+                # signal that output was truncated).  Tool-call extraction
+                # on partial output is already benign — the regex either
+                # finds a complete <tool_call>…</tool_call> or returns none.
+                finish_reason = (
+                    "length"
+                    if generation_aborted
+                    else ("tool_calls" if tool_calls else "stop")
+                )
                 cache_key.extend(generated_tokens)
-                with prompt_cache_lock:
-                    _insert_cache_entries(
-                        model_name=SETTINGS.model_path,
-                        session_ctx=session_ctx,
-                        cache_key=cache_key,
-                        prompt_cache=prompt_cache,
-                        generated_tokens=generated_tokens,
-                        tool_calls=tool_calls,
-                    )
-                    # --- M5: Update session turn record for next-turn stable-prefix lookup ---
-                    if _session_id_for_turn:
-                        _update_session_turn_store(
-                            _session_id_for_turn,
-                            messages,
-                            prompt_tokens,
+                # G2: insert cache + advance session-turn record ONLY on
+                # clean completion.  Partial KV state with a completion key
+                # that ends mid-token would silently corrupt next-turn
+                # attention; a half-written session-turn record would
+                # misreport the stable-prefix boundary.
+                if not generation_aborted:
+                    with prompt_cache_lock:
+                        _insert_cache_entries(
+                            model_name=SETTINGS.model_path,
+                            session_ctx=session_ctx,
+                            cache_key=cache_key,
+                            prompt_cache=prompt_cache,
+                            generated_tokens=generated_tokens,
+                            tool_calls=tool_calls,
+                            prompt_model_tokens=model_tokens,
                         )
+                        # --- M5: Update session turn record for next-turn stable-prefix lookup ---
+                        if _session_id_for_turn:
+                            _update_session_turn_store(
+                                _session_id_for_turn,
+                                messages,
+                                prompt_tokens,
+                            )
 
                 response_id = f"chatcmpl-{int(time.time())}"
+                # Additive reasoning extraction: compute alongside the legacy
+                # `message_text` so clients that understand `reasoning_content`
+                # (PI, OpenAI Responses-aware tools) render the thinking block,
+                # and clients that don't see byte-identical content.
+                _, reasoning_text_nonstream = (
+                    _split_text_for_reasoning(
+                        raw_response_text, enable_thinking, SETTINGS.model_family
+                    )
+                    if enable_thinking
+                    else ("", "")
+                )
+                assistant_msg: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": message_text,
+                }
+                if reasoning_text_nonstream:
+                    assistant_msg["reasoning_content"] = reasoning_text_nonstream
                 full_response = {
                     "id": response_id,
                     "object": "chat.completion",
@@ -3260,7 +4562,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     "choices": [
                         {
                             "index": 0,
-                            "message": {"role": "assistant", "content": message_text},
+                            "message": assistant_msg,
                             "finish_reason": finish_reason,
                         }
                     ],
@@ -3308,7 +4610,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                # Close the connection after the stream completes — the
+                # single-threaded HTTPServer otherwise parks on this socket
+                # waiting for a follow-up request and starves new connections.
+                # (_mark_connection_close() already set close_connection=True;
+                # this header just tells the peer the same thing.)
+                self.send_header("Connection", "close")
                 self.end_headers()
 
                 response_id = f"chatcmpl-{int(time.time())}"
@@ -3329,7 +4636,38 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
 
                 raw_parts = []
+                message_text_parts: List[str] = []
+                reasoning_text_parts: List[str] = []
                 progress_last_at = time.time()
+                splitter = _ReasoningStreamSplitter(
+                    enable_thinking, SETTINGS.model_family
+                )
+
+                def _emit_delta(kind: str, text: str) -> None:
+                    """Send an SSE chunk with reasoning_content or content delta."""
+                    if not text:
+                        return
+                    field = (
+                        "reasoning_content" if kind == "reasoning" else "content"
+                    )
+                    chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": SETTINGS.proxy_model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {field: text},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    self.wfile.write(
+                        f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                    )
+                    self.wfile.flush()
+
                 for response in _stream_generate_unified(
                     rest_tokens,
                     max_tokens,
@@ -3346,6 +4684,16 @@ class APIHandler(BaseHTTPRequestHandler):
                     response_text = response.text
                     if response_text:
                         raw_parts.append(response_text)
+                        # Live split + emit.  Tool-call text is accumulated in
+                        # the splitter's tool buffer and NOT emitted here — it
+                        # will surface at flush() for `_extract_openai_tool_calls`
+                        # so we can emit `delta.tool_calls` deltas cleanly.
+                        for kind, chunk_text in splitter.feed(response_text):
+                            if kind == "reasoning":
+                                reasoning_text_parts.append(chunk_text)
+                            else:
+                                message_text_parts.append(chunk_text)
+                            _emit_delta(kind, chunk_text)
                     if (
                         len(generated_tokens) % 64 == 0
                         and (time.time() - progress_last_at) >= 1.0
@@ -3356,22 +4704,74 @@ class APIHandler(BaseHTTPRequestHandler):
                             f"Request {request_id} in progress | generated_tokens={len(generated_tokens)}",
                             indent=1,
                         )
+                    # G2: cooperative abort between tokens — same rationale
+                    # as the non-streaming path.  Partial KV state must not
+                    # be cached; the streaming epilogue below emits a
+                    # terminal chunk with finish_reason="length" so the
+                    # client receives clean framing.
+                    if watchdog_flag.is_set():
+                        generation_aborted = True
+                        _terminal_status(
+                            "⏱️",
+                            f"Request {request_id} aborted by watchdog "
+                            f"after {SETTINGS.generation_watchdog_seconds}s "
+                            f"| partial_tokens={len(generated_tokens)}",
+                            indent=1,
+                        )
+                        break
 
-                full_text = "".join(raw_parts)
-                raw_full_text = full_text
+                # Drain the splitter: emits residual content/reasoning chunks
+                # and returns any buffered tool-call XML.
+                tail_chunks, tool_buffer_text = splitter.flush()
+                for kind, chunk_text in tail_chunks:
+                    if kind == "reasoning":
+                        reasoning_text_parts.append(chunk_text)
+                    else:
+                        message_text_parts.append(chunk_text)
+                    _emit_delta(kind, chunk_text)
+
+                raw_full_text = "".join(raw_parts)
+                # Run the legacy end-of-stream pipeline on the FULL raw text
+                # so cache insert / healing / tool-call extraction stay
+                # byte-identical to the non-streaming path.  This preserves
+                # the dual-pipeline invariant — live deltas are a view, not
+                # a replacement for the canonical post-processing.
                 full_text = _normalize_assistant_text(
-                    full_text, enable_thinking, SETTINGS.model_family
+                    raw_full_text, enable_thinking, SETTINGS.model_family
                 )
-                message_text, tool_calls = _extract_openai_tool_calls(
+                canonical_message_text, tool_calls = _extract_openai_tool_calls(
                     full_text, SETTINGS.model_family
                 )
-                # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
-                    message_text = _strip_thinking_from_content(message_text)
+                    canonical_message_text = _strip_thinking_from_content(
+                        canonical_message_text
+                    )
 
-                    # --- NEW HEALING STORE LOGIC ---
-                    if raw_full_text != message_text:
-                        h = _get_healing_hash(message_text, tool_calls)
+                # When the splitter entered TOOL mode we held back all text
+                # from the first `<tool_call>` sentinel onward.  Re-running
+                # `_extract_openai_tool_calls` on that buffer yields any
+                # surrounding-but-non-tool-call text; emit it now as a final
+                # content delta so the client sees text before AND after tool
+                # calls (mirroring non-streaming `message.content`).
+                if tool_buffer_text:
+                    trailing_content, _ = _extract_openai_tool_calls(
+                        tool_buffer_text, SETTINGS.model_family
+                    )
+                    trailing_content = trailing_content.strip()
+                    if trailing_content:
+                        message_text_parts.append(trailing_content)
+                        _emit_delta("content", trailing_content)
+
+                # Healing hash uses the stripped text — what the client will
+                # echo back in the next turn's assistant message — so the
+                # canonical message_text is the correct key.  The raw stream
+                # text is what we heal back to on next-turn replay.
+                if enable_thinking:
+                    if (
+                        raw_full_text != canonical_message_text
+                        and not generation_aborted
+                    ):
+                        h = _get_healing_hash(canonical_message_text, tool_calls)
                         if h:
                             with HEALING_STORE_LOCK:
                                 HEALING_STORE[h] = raw_full_text
@@ -3379,40 +4779,30 @@ class APIHandler(BaseHTTPRequestHandler):
                                 while len(HEALING_STORE) > MAX_HEALING_STORE:
                                     HEALING_STORE.popitem(last=False)
 
-                cache_key.extend(generated_tokens)
-                with prompt_cache_lock:
-                    _insert_cache_entries(
-                        model_name=SETTINGS.model_path,
-                        session_ctx=session_ctx,
-                        cache_key=cache_key,
-                        prompt_cache=prompt_cache,
-                        generated_tokens=generated_tokens,
-                        tool_calls=tool_calls,
-                    )
-                    # --- M5: Update session turn record for next-turn stable-prefix lookup ---
-                    if _session_id_for_turn:
-                        _update_session_turn_store(
-                            _session_id_for_turn,
-                            messages,
-                            prompt_tokens,
-                        )
+                # Alias names used downstream for logging + cache insert.
+                message_text = canonical_message_text
+                full_text = canonical_message_text
 
-                if message_text:
-                    chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": SETTINGS.proxy_model_id,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": message_text},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
-                    self.wfile.flush()
+                cache_key.extend(generated_tokens)
+                # G2: only insert + advance session on clean completion.
+                if not generation_aborted:
+                    with prompt_cache_lock:
+                        _insert_cache_entries(
+                            model_name=SETTINGS.model_path,
+                            session_ctx=session_ctx,
+                            cache_key=cache_key,
+                            prompt_cache=prompt_cache,
+                            generated_tokens=generated_tokens,
+                            tool_calls=tool_calls,
+                            prompt_model_tokens=model_tokens,
+                        )
+                        # --- M5: Update session turn record for next-turn stable-prefix lookup ---
+                        if _session_id_for_turn:
+                            _update_session_turn_store(
+                                _session_id_for_turn,
+                                messages,
+                                prompt_tokens,
+                            )
 
                 if tool_calls:
                     for idx, tc in enumerate(tool_calls):
@@ -3434,7 +4824,13 @@ class APIHandler(BaseHTTPRequestHandler):
                         )
                         self.wfile.flush()
 
-                finish_reason = "tool_calls" if tool_calls else "stop"
+                # G2: override finish_reason on abort — OpenAI-standard
+                # "length" tells the client the response was truncated.
+                finish_reason = (
+                    "length"
+                    if generation_aborted
+                    else ("tool_calls" if tool_calls else "stop")
+                )
                 final_chunk = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -3538,6 +4934,27 @@ class APIHandler(BaseHTTPRequestHandler):
                         ),
                         indent=1,
                     )
+            # G2: cancel the watchdog timer unconditionally.  cancel() is
+            # idempotent on Timer — safe if it already fired.  Must happen
+            # BEFORE releasing model_lock so a slow cancel can't race with
+            # the next request acquiring the lock and seeing a leftover
+            # flag from a prior request (the flag is per-request-local so
+            # this is extra belt-and-braces, but cheap).
+            if watchdog_timer is not None:
+                try:
+                    watchdog_timer.cancel()
+                except Exception:
+                    pass
+            # P4: drop any unconsumed per-request bump records (non-stream
+            # path consumes via _metrics_drain_request; log failures or
+            # early exits would otherwise leak this dict entry).  Also
+            # clear the thread-local request id so later bump sites on the
+            # same thread don't misattribute to a finished request.
+            try:
+                _metrics_drain_request(request_id)
+            except Exception:
+                pass
+            _set_current_request_id(None)
             # On normal exit or Python exception, release the lock. On process abort (e.g. Metal
             # "uncommitted encoder" crash), finally may not run, so the "leaked semaphore" warning
             # at shutdown is expected; fixing the Metal crash resolves it.
@@ -3548,7 +4965,15 @@ class APIHandler(BaseHTTPRequestHandler):
 def run():
     start_litellm_proxy()
     server_address = (SETTINGS.mlx_host, SETTINGS.mlx_port)
-    httpd = ThreadingHTTPServer(server_address, APIHandler)
+    # MLX 0.31 streams are strictly per-thread and mlx-vlm 0.4.4's generate_step
+    # issues bare `mx.async_eval(y)` calls outside a `with mx.stream(...)` block,
+    # which crashes in worker threads ("There is no Stream(gpu, N) in current
+    # thread."). Since all GPU work already serializes through model_lock, we
+    # serve requests single-threaded from the main thread where the module-level
+    # `generation_stream` was created. When upstream mlx-vlm moves to
+    # `mx.new_thread_local_stream` (or moves the async_eval inside a stream
+    # context) this can revert to ThreadingHTTPServer.
+    httpd = HTTPServer(server_address, APIHandler)
 
     print("\n" + "=" * 50)
     print("🟢 SYSTEM READY")
