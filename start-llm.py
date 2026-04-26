@@ -189,6 +189,11 @@ class Settings:
     proxy_model_id: str
     preserve_thinking: bool
     generation_watchdog_seconds: int
+    # G4v2: per-layer boundary snapshots for hybrid VLM caches.
+    enable_snapshot_stitch_vlm: bool
+    snapshot_store_max_entries_per_session: int
+    snapshot_store_max_entries_global: int
+    snapshot_boundary_min_gap_tokens: int
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -277,6 +282,16 @@ def _build_settings() -> Settings:
         proxy_model_id=proxy_model_id,
         preserve_thinking=_env_bool("PRESERVE_THINKING", True),
         generation_watchdog_seconds=_env_int("GENERATION_WATCHDOG_SECONDS", 600),
+        enable_snapshot_stitch_vlm=_env_bool("ENABLE_SNAPSHOT_STITCH_VLM", True),
+        snapshot_store_max_entries_per_session=_env_int(
+            "SNAPSHOT_STORE_MAX_ENTRIES_PER_SESSION", 16
+        ),
+        snapshot_store_max_entries_global=_env_int(
+            "SNAPSHOT_STORE_MAX_ENTRIES_GLOBAL", 64
+        ),
+        snapshot_boundary_min_gap_tokens=_env_int(
+            "SNAPSHOT_BOUNDARY_MIN_GAP_TOKENS", 512
+        ),
     )
 
 
@@ -817,6 +832,18 @@ _CACHE_METRICS: Dict[str, int] = {
     "vlm_retreat": 0,
     "hybrid_trim_miss": 0,
     "exact_key_rejected_by_model_lcp": 0,
+    # G4v2: per-layer boundary snapshot counters.
+    #   snapshot_emitted — a boundary snapshot was successfully captured.
+    #   snapshot_stitch_hit — a cache-miss was rescued by stitching a
+    #                         snapshot with a full-turn entry (the primary
+    #                         success signal for G4v2).
+    #   snapshot_stitch_skipped_no_candidate — trim failed AND no snapshot
+    #                         at or below target depth existed; a true miss.
+    #   snapshot_evicted — an entry was dropped by the LRU.
+    "snapshot_emitted": 0,
+    "snapshot_stitch_hit": 0,
+    "snapshot_stitch_skipped_no_candidate": 0,
+    "snapshot_evicted": 0,
 }
 _CACHE_METRICS_LOCK = threading.Lock()
 # Per-request tracking: which counters bumped during THIS request, keyed by
@@ -845,12 +872,16 @@ def _bump_metric(name: str, request_id: Optional[str] = None, by: int = 1) -> in
     # Emit OUTSIDE the lock: _terminal_status takes console_lock, so keeping
     # the two lock regions disjoint removes any future ordering hazard if
     # console code ever needs to read metrics.
-    _terminal_status(
-        "🧪",
-        f"metric {name} bumped (+{by}, total={new_total})"
-        + (f" request={request_id}" if request_id else ""),
-        indent=1,
-    )
+    #
+    # Silence high-frequency G4v2 snapshot counters (up to 16 emits per
+    # long turn) — they're summarised once per request at completion.
+    if not name.startswith("snapshot_"):
+        _terminal_status(
+            "🧪",
+            f"metric {name} bumped (+{by}, total={new_total})"
+            + (f" request={request_id}" if request_id else ""),
+            indent=1,
+        )
     return new_total
 
 
@@ -1301,7 +1332,9 @@ class LRUPromptCache:
             i += 1
         return i
 
-    def fetch_nearest_cache(self, model, tokens, request_model_tokens=None):
+    def fetch_nearest_cache(
+        self, model, tokens, request_model_tokens=None, session_id: Optional[str] = None
+    ):
         """
         Lookup a cached KV state that can serve `tokens` (canonical request
         cache key).  Uses canonical block hashes for candidate discovery, then
@@ -1328,6 +1361,41 @@ class LRUPromptCache:
             if request_model_tokens is not None
             else tokens_tup
         )
+
+        def _try_stitch_recovery(full_entry_cache, target_depth):
+            """
+            G4v2: try to rescue a would-be hybrid-trim miss with a
+            per-layer stitched cache.  Returns (stitched_cache,
+            snap.model_token_count, snap.canonical_token_count) on success,
+            None on failure (caller proceeds to miss).
+            """
+            if (
+                not SETTINGS.enable_snapshot_stitch_vlm
+                or not _NON_SLICEABLE_LAYER_INDICES
+                or not session_id
+                or target_depth <= 0
+            ):
+                return None
+            snap = SNAPSHOT_STORE.fetch_at_or_below(session_id, target_depth)
+            if snap is None or snap.model_token_count <= 0:
+                _bump_metric(
+                    "snapshot_stitch_skipped_no_candidate", _current_request_id()
+                )
+                return None
+            try:
+                stitched = _stitch_cache(
+                    snap, full_entry_cache, snap.model_token_count
+                )
+            except Exception as e:
+                _terminal_status(
+                    "⚠️",
+                    f"stitch failed (target_depth={target_depth} "
+                    f"snap_depth={snap.model_token_count}): {e}",
+                    indent=1,
+                )
+                return None
+            _bump_metric("snapshot_stitch_hit", _current_request_id())
+            return stitched, snap.model_token_count, snap.canonical_token_count
 
         def _trim_to_model_depth(cache_state, entry_model_tokens, target_model_len):
             """
@@ -1399,6 +1467,16 @@ class LRUPromptCache:
                     entry.prompt_cache, entry.model_tokens, target
                 )
                 if not ok:
+                    stitched = _try_stitch_recovery(entry.prompt_cache, target)
+                    if stitched is not None:
+                        st_cache, st_depth, st_canon = stitched
+                        return (
+                            st_cache,
+                            list(req_model)[st_depth:],
+                            tokens_tup,
+                            "stitch",
+                            st_canon,
+                        )
                     return None, list(req_model), tokens_tup, "miss", 0
                 rest = list(req_model)[eff:]
                 # P6/1c: report canonical match length WITHOUT the -1 model-
@@ -1495,6 +1573,16 @@ class LRUPromptCache:
             entry.prompt_cache, best_entry_model_tokens, target_model_len
         )
         if not ok:
+            stitched = _try_stitch_recovery(entry.prompt_cache, target_model_len)
+            if stitched is not None:
+                st_cache, st_depth, st_canon = stitched
+                return (
+                    st_cache,
+                    list(req_model)[st_depth:],
+                    best_cached_tokens,
+                    "stitch",
+                    st_canon,
+                )
             return None, list(req_model), tokens_tup, "miss", 0
 
         if effective_kv == len(req_model):
@@ -1612,6 +1700,281 @@ PROMPT_CACHE = LRUPromptCache(
     max_size=SETTINGS.prompt_cache_max_entries_global,
     ttl_seconds=SETTINGS.prompt_cache_ttl_seconds,
 )
+
+
+# --- G4v2: per-layer boundary snapshots for hybrid VLM ---
+# `ArraysCache` / linear-attention layers on hybrid VLM caches are not
+# trimmable.  Before this, a single token of drift past the prompt boundary
+# forced a full cold prefill.  G4v2 snapshots ONLY the non-sliceable layers
+# at message-end boundaries during prefill; at lookup we stitch the snapshot
+# with the sliceable layers of any full-turn entry (per-layer trimmed).  See
+# `.context/docs/G4-hybrid-vlm-prompt-checkpoint.md` §3-4 for design,
+# `scripts/probe_stitch_correctness.py` for the bit-exact correctness probe.
+_SLICEABLE_CACHE_CLASSES = frozenset({
+    "KVCache",
+    "BatchKVCache",
+    "QuantizedKVCache",
+    "TurboQuantKVCache",
+    "BatchTurboQuantKVCache",
+    "RotatingKVCache",
+})
+
+# Populated once at model load by `_classify_cache_layers`.  Empty set means
+# "nothing to snapshot" — either a non-hybrid model or the classifier couldn't
+# probe make_cache().  In that case the fork path is inert: it behaves like
+# a bare `stream_generate_vlm` with no snapshot emission or stitch recovery.
+_NON_SLICEABLE_LAYER_INDICES: frozenset = frozenset()
+
+
+def _is_sliceable_cache_layer(layer: Any) -> bool:
+    return type(layer).__name__ in _SLICEABLE_CACHE_CLASSES
+
+
+def _classify_cache_layers(lm: Any) -> frozenset:
+    """
+    Inspect model.make_cache() once at startup to determine which layer
+    indices are non-sliceable (linear-attention / recurrent / ArraysCache).
+    These are the layers that need snapshotting; sliceable layers get
+    per-layer-trimmed on demand at stitch time.
+    """
+    if lm is None or not hasattr(lm, "make_cache"):
+        return frozenset()
+    try:
+        probe = lm.make_cache()
+    except Exception:
+        return frozenset()
+    if not probe:
+        return frozenset()
+    non_sliceable = {
+        i for i, c in enumerate(probe) if not _is_sliceable_cache_layer(c)
+    }
+    return frozenset(non_sliceable)
+
+
+@dataclass
+class PartialSnapshot:
+    session_id: str
+    model_token_count: int  # depth at which snapshot was taken (model space)
+    layers: List[Any]  # length == num_layers; None for sliceable, deepcopy for non-sliceable
+    canonical_token_count: int  # for telemetry / M3 reporting
+    created_at: float
+    request_id: Optional[str]
+
+
+class _SnapshotStore:
+    """
+    Per-session LRU of PartialSnapshot keyed by (session_id, model_token_count).
+
+    Thread-safety: protected by `prompt_cache_lock` (same lock that guards
+    PROMPT_CACHE / SESSION_TURN_STORE).  Callers must already hold the lock
+    when they call into this store.
+
+    Eviction: global max + per-session max.  On global overflow, evict the
+    oldest entry across all sessions (LRU by touched_at).  On per-session
+    overflow, evict the oldest entry for that session.
+    """
+
+    def __init__(
+        self,
+        max_per_session: int = 16,
+        max_global: int = 64,
+    ) -> None:
+        self._max_per_session = max(1, max_per_session)
+        self._max_global = max(self._max_per_session, max_global)
+        # session_id -> OrderedDict[model_token_count -> PartialSnapshot]
+        self._by_session: Dict[str, "OrderedDict[int, PartialSnapshot]"] = {}
+        # (session_id, model_token_count) -> touched_at for LRU
+        self._touched: Dict[Tuple[str, int], float] = {}
+
+    def __len__(self) -> int:
+        return sum(len(v) for v in self._by_session.values())
+
+    def put(self, snap: PartialSnapshot) -> None:
+        session_id = snap.session_id
+        if not session_id:
+            return
+        bucket = self._by_session.setdefault(session_id, OrderedDict())
+        key = (session_id, snap.model_token_count)
+        if snap.model_token_count in bucket:
+            bucket.pop(snap.model_token_count)
+        bucket[snap.model_token_count] = snap
+        self._touched[key] = snap.created_at
+        # Per-session evict
+        while len(bucket) > self._max_per_session:
+            evicted_depth, _ = bucket.popitem(last=False)
+            self._touched.pop((session_id, evicted_depth), None)
+            _bump_metric("snapshot_evicted", snap.request_id)
+        # Global evict
+        total = len(self)
+        while total > self._max_global:
+            # Find oldest across all sessions
+            oldest_key = min(self._touched, key=lambda k: self._touched[k])
+            self._touched.pop(oldest_key, None)
+            sid, depth = oldest_key
+            sbucket = self._by_session.get(sid)
+            if sbucket is not None and depth in sbucket:
+                sbucket.pop(depth)
+                if not sbucket:
+                    self._by_session.pop(sid, None)
+            _bump_metric("snapshot_evicted", snap.request_id)
+            total -= 1
+
+    def fetch_at_or_below(
+        self, session_id: str, target_model_tokens: int
+    ) -> Optional[PartialSnapshot]:
+        """
+        Return the snapshot with the LARGEST model_token_count <=
+        target_model_tokens for this session.  None if none exists.
+        """
+        if not session_id:
+            return None
+        bucket = self._by_session.get(session_id)
+        if not bucket:
+            return None
+        best = None
+        for depth, snap in bucket.items():
+            if depth <= target_model_tokens and (best is None or depth > best.model_token_count):
+                best = snap
+        return best
+
+    def clear(self) -> None:
+        self._by_session.clear()
+        self._touched.clear()
+
+
+SNAPSHOT_STORE = _SnapshotStore(
+    max_per_session=SETTINGS.snapshot_store_max_entries_per_session,
+    max_global=SETTINGS.snapshot_store_max_entries_global,
+)
+
+
+def _snapshot_capture_layers(prompt_cache: List[Any]) -> List[Any]:
+    """
+    Build a partial-layer snapshot: deepcopy non-sliceable layers, None for
+    sliceable.  Eager-materialize arrays before deepcopy to defeat any MLX
+    lazy-compute aliasing (defensive — the §7.2 probe showed deepcopy works
+    as-is, but mx.eval is zero-cost here and future-proofs).
+    """
+    # Force materialization of anything pending on the current stream.
+    to_eval = []
+    for c in prompt_cache:
+        st = getattr(c, "state", None)
+        if st is None:
+            continue
+        if isinstance(st, (list, tuple)):
+            for arr in st:
+                if arr is not None and hasattr(arr, "shape"):
+                    to_eval.append(arr)
+        elif hasattr(st, "shape"):
+            to_eval.append(st)
+    if to_eval:
+        try:
+            mx.eval(*to_eval)
+        except Exception:
+            pass
+    layers: List[Any] = []
+    for i, c in enumerate(prompt_cache):
+        if i in _NON_SLICEABLE_LAYER_INDICES:
+            layers.append(copy.deepcopy(c))
+        else:
+            layers.append(None)
+    return layers
+
+
+def _per_layer_trim_sliceable_layer(layer: Any, target_depth: int) -> None:
+    """
+    In-place per-layer trim of a KVCache-like sliceable layer to target_depth.
+    Non-sliceable layers must never be passed here.
+    """
+    cur = int(getattr(layer, "offset", 0) or 0)
+    if cur <= target_depth:
+        return
+    keys = getattr(layer, "keys", None)
+    values = getattr(layer, "values", None)
+    if keys is not None and values is not None:
+        layer.keys = keys[..., :target_depth, :]
+        layer.values = values[..., :target_depth, :]
+        layer.offset = target_depth
+    else:
+        # QuantizedKVCache / TurboQuant — fall back to the public
+        # trim_prompt_cache interface on a single-element list.
+        trim_prompt_cache([layer], cur - target_depth)
+
+
+def _stitch_cache(
+    snapshot: PartialSnapshot,
+    full_entry_cache: List[Any],
+    target_depth: int,
+) -> List[Any]:
+    """
+    Compose a stitched cache at `target_depth` (model-token space) from:
+      - `snapshot.layers[i]` for every i in _NON_SLICEABLE_LAYER_INDICES
+      - `full_entry_cache[i]` deep-copied and per-layer-trimmed to target_depth
+        for every other i.
+
+    Returns a fresh list of layer objects.  Neither source is mutated.
+    """
+    assert len(snapshot.layers) == len(full_entry_cache), (
+        f"layer count mismatch: snapshot={len(snapshot.layers)} "
+        f"full_entry={len(full_entry_cache)}"
+    )
+    out: List[Any] = [None] * len(full_entry_cache)
+    for i in _NON_SLICEABLE_LAYER_INDICES:
+        snap_layer = snapshot.layers[i]
+        if snap_layer is None:
+            # Shouldn't happen — index was flagged non-sliceable at classify
+            # time but the snapshot doesn't have it.  Fail fast rather than
+            # silently produce garbage decode.
+            raise RuntimeError(
+                f"stitch: snapshot missing non-sliceable layer {i}"
+            )
+        out[i] = copy.deepcopy(snap_layer)
+    for i in range(len(full_entry_cache)):
+        if out[i] is not None:
+            continue
+        trimmed = copy.deepcopy(full_entry_cache[i])
+        _per_layer_trim_sliceable_layer(trimmed, target_depth)
+        out[i] = trimmed
+    return out
+
+
+def _compute_snapshot_boundaries(
+    msg_token_lens: List[int],
+    prompt_token_len: int,
+    min_gap_tokens: int,
+    max_count: int,
+) -> List[int]:
+    """
+    Pick model-token offsets (message-end cumulative positions) at which to
+    emit snapshots, spaced at least `min_gap_tokens` apart.  Excludes the
+    final prompt boundary (we always snapshot that separately after the
+    last prefill chunk).
+
+    Returns a sorted list of positive offsets strictly less than
+    prompt_token_len.
+    """
+    if not msg_token_lens:
+        return []
+    cum = 0
+    candidates: List[int] = []
+    for n in msg_token_lens:
+        cum += int(n or 0)
+        if 0 < cum < prompt_token_len:
+            candidates.append(cum)
+    if not candidates:
+        return []
+    # Space out: keep first, then skip any within min_gap of the last kept.
+    picked: List[int] = []
+    last = -(min_gap_tokens + 1)
+    for c in candidates:
+        if c - last >= min_gap_tokens:
+            picked.append(c)
+            last = c
+    # Cap total count (keep the LATEST ones — they're the most useful prefixes
+    # for the next turn).
+    if len(picked) > max_count:
+        picked = picked[-max_count:]
+    return picked
 
 
 @dataclass(frozen=True)
@@ -1782,8 +2145,11 @@ class SessionIndex:
         """Always use global cache; session/conversation/thread ID is ignored for lookup."""
         prompt_cache_store.prune_expired()
         self._prune_idle()
+        _session_id = (session_ctx.session_id or "").strip() if session_ctx else None
         selected = prompt_cache_store.fetch_nearest_cache(
-            model_name, prompt_tokens, request_model_tokens=model_tokens
+            model_name, prompt_tokens,
+            request_model_tokens=model_tokens,
+            session_id=_session_id,
         )
         return (*selected, "global")
 
@@ -3716,6 +4082,29 @@ _terminal_status(
         f"healing_store_capacity={MAX_HEALING_STORE}"
     ),
 )
+
+# G4v2: classify cache layers AFTER model load so SNAPSHOT_STORE emission
+# knows which layer indices need deepcopy vs per-layer trim.  For LM
+# (non-hybrid) and non-hybrid VLMs this returns an empty set; the fork path
+# stays inert.
+try:
+    _lm_for_classify = (
+        model.language_model
+        if is_vlm and hasattr(model, "language_model")
+        else model
+    )
+    _NON_SLICEABLE_LAYER_INDICES = _classify_cache_layers(_lm_for_classify)
+except Exception:
+    _NON_SLICEABLE_LAYER_INDICES = frozenset()
+_hybrid_layer_hit = len(_NON_SLICEABLE_LAYER_INDICES) > 0
+_terminal_status(
+    "🧩",
+    (
+        f"Cache layer classification: "
+        f"non_sliceable={len(_NON_SLICEABLE_LAYER_INDICES)} "
+        f"(snapshot-stitch {'enabled' if (_hybrid_layer_hit and SETTINGS.enable_snapshot_stitch_vlm) else 'disabled'})"
+    ),
+)
 _kv_desc = f"bits={SETTINGS.kv_bits}" if SETTINGS.kv_bits is not None else "OFF"
 if SETTINGS.kv_bits is not None and SETTINGS.kv_quant_scheme == "turboquant":
     _kv_desc += f" scheme=turboquant start={SETTINGS.quantized_kv_start}"
@@ -3740,6 +4129,265 @@ def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
     return kwargs
 
 
+def _vlm_generate_with_snapshots(
+    rest_ids: mx.array,
+    pixel_values: Any,
+    mask: Any,
+    vlm_kwargs: Optional[Dict[str, Any]],
+    prompt_cache: List[Any],
+    sampler: Any,
+    max_tokens: int,
+    snapshot_boundaries: List[int],
+    on_snapshot: Optional[Any],
+    cache_base_depth: int,
+    prefill_step_size: int = 512,
+):
+    """
+    G4v2 fork of mlx_vlm.generate.{generate_step,stream_generate}.
+
+    Drop-in replacement for `stream_generate_vlm` along the hybrid-VLM
+    path: yields `GenerationResult` objects with `.text` / `.token` so the
+    server's existing consumer loops are unchanged.
+
+    Fork delta vs. upstream (mlx-vlm 0.4.4 generate.py:672-1152):
+      1. Chunked prefill is ALWAYS used (upstream guards with
+         `inputs_embeds.shape[1] > prefill_step_size`); simplifies control
+         flow and ensures the snapshot-emit path runs on all prompt sizes.
+      2. Between prefill chunks, we check `snapshot_boundaries`.  If a
+         boundary falls mid-chunk we clamp the chunk so the cache lands
+         exactly at the boundary; then `on_snapshot(boundary, cache)` is
+         invoked synchronously before advancing.
+      3. A final boundary snapshot is emitted between the last prefill
+         forward and the first yielded decode token — captures the
+         "prompt-only, pre-decode" state described in the v2 spec §4.1.
+      4. Dropped: speculative decoding, thinking_budget_criteria, chunked
+         prefill over images (we don't hit these paths on pi/OpenClaw
+         text-only traffic).  Fallback: set ENABLE_SNAPSHOT_STITCH_VLM=false
+         to revert to upstream `stream_generate_vlm` for any request that
+         needs them.
+
+    Args:
+      rest_ids: tail model tokens to prefill (after any cache reuse).
+      pixel_values/mask: VLM vision tensors (None for text-only turns).
+      vlm_kwargs: additional forward kwargs (tool-call prefill hints etc.).
+      prompt_cache: the list of cache layers already at `cache_base_depth`.
+      sampler: mlx_lm sampler callable (temperature/top-p/top-k).
+      max_tokens: upper bound on yielded decode tokens.
+      snapshot_boundaries: list of absolute model-token depths (cumulative
+        from position 0) at which to emit snapshots.  Only boundaries
+        strictly greater than `cache_base_depth` can be emitted.
+      on_snapshot: callable(boundary_depth, cache) invoked synchronously
+        when a boundary is crossed.  May raise; exceptions are caught and
+        logged.
+      cache_base_depth: KV depth already in `prompt_cache` before this call
+        (reused prefix from previous turns).  Snapshots are emitted at
+        absolute depths, so boundaries compare against
+        `cache_base_depth + processed_tokens`.
+      prefill_step_size: chunk size for prefill (matches upstream default).
+    """
+    from mlx_vlm.generate import (
+        generation_stream as _gen_stream,
+        GenerationResult,
+        wired_limit,
+        maybe_quantize_kv_cache,
+    )
+
+    kwargs = dict(vlm_kwargs or {})
+    kv_quantized_start = kwargs.pop("quantized_kv_start", SETTINGS.quantized_kv_start)
+    kv_group_size = kwargs.pop("kv_group_size", SETTINGS.kv_group_size)
+    kv_bits = kwargs.pop("kv_bits", SETTINGS.kv_bits)
+    kv_quant_scheme = kwargs.pop("kv_quant_scheme", SETTINGS.kv_quant_scheme)
+    for _k in (
+        "max_kv_size", "prompt_cache", "input_ids", "pixel_values",
+        "mask", "max_tokens", "sampler",
+    ):
+        kwargs.pop(_k, None)
+
+    def _quantize_fn(cache):
+        return maybe_quantize_kv_cache(
+            cache,
+            quantized_kv_start=kv_quantized_start,
+            kv_group_size=kv_group_size,
+            kv_bits=kv_bits,
+            kv_quant_scheme=kv_quant_scheme,
+        )
+
+    boundaries = sorted({int(b) for b in (snapshot_boundaries or []) if int(b) > cache_base_depth})
+
+    input_ids = rest_ids
+
+    total_prompt_tokens = cache_base_depth + int(input_ids.shape[1])
+
+    _tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    stopping_criteria = getattr(_tokenizer, "stopping_criteria", None)
+    detokenizer = getattr(processor, "detokenizer", None) or getattr(
+        _tokenizer, "detokenizer", None
+    )
+    if detokenizer is not None:
+        try:
+            detokenizer.reset()
+        except Exception:
+            detokenizer = None
+
+    with wired_limit(model, [_gen_stream]):
+        with mx.stream(_gen_stream):
+            emb = model.get_input_embeddings(
+                input_ids, pixel_values, mask=mask, **kwargs
+            )
+            inputs_embeds = emb.inputs_embeds
+            kwargs.update(
+                {
+                    k: v
+                    for k, v in emb.to_dict().items()
+                    if k != "inputs_embeds" and v is not None
+                }
+            )
+
+            processed_tokens = 0
+
+            def _emit_boundaries_upto(current_depth: int) -> None:
+                nonlocal boundaries
+                while boundaries and boundaries[0] <= current_depth:
+                    b = boundaries.pop(0)
+                    if on_snapshot is None:
+                        continue
+                    try:
+                        on_snapshot(b, prompt_cache)
+                    except Exception as e:
+                        _terminal_status(
+                            "⚠️",
+                            f"snapshot-emit failed at depth={b}: {e}",
+                            indent=1,
+                        )
+
+            # Chunked prefill on everything except the last token.
+            while inputs_embeds.shape[1] > 1:
+                n_avail = inputs_embeds.shape[1] - 1
+                n_to_process = min(prefill_step_size, n_avail)
+                current_depth = cache_base_depth + processed_tokens
+                if boundaries:
+                    nb = boundaries[0]
+                    if current_depth < nb <= current_depth + n_to_process:
+                        n_to_process = nb - current_depth
+
+                model.language_model(
+                    inputs=input_ids[:, :n_to_process],
+                    inputs_embeds=inputs_embeds[:, :n_to_process],
+                    cache=prompt_cache,
+                    n_to_process=n_to_process,
+                    **kwargs,
+                )
+                _quantize_fn(prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                processed_tokens += n_to_process
+
+                _emit_boundaries_upto(cache_base_depth + processed_tokens)
+
+                inputs_embeds = inputs_embeds[:, n_to_process:]
+                input_ids = input_ids[:, n_to_process:]
+                mx.clear_cache()
+
+            # Last-token forward + sample first decoded token.
+            outputs = model.language_model(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                cache=prompt_cache,
+                **kwargs,
+            )
+            logits = outputs.logits[:, -1, :]
+            _quantize_fn(prompt_cache)
+            processed_tokens += int(input_ids.shape[1])
+
+            # Final boundary: after prompt fully prefilled, before decode.
+            _emit_boundaries_upto(cache_base_depth + processed_tokens)
+
+            logprobs = logits - mx.logsumexp(logits)
+            y = sampler(logprobs)
+
+            if outputs.cross_attention_states is not None:
+                kwargs = {"cross_attention_states": outputs.cross_attention_states}
+            elif outputs.encoder_outputs is not None:
+                kwargs = {"encoder_outputs": outputs.encoder_outputs}
+            else:
+                kwargs = {}
+
+        mx.async_eval(y)
+
+        def _decode_step(y_in):
+            nonlocal kwargs
+            with mx.stream(_gen_stream):
+                outputs = model.language_model(
+                    y_in, cache=prompt_cache, **kwargs,
+                )
+                logits = outputs.logits[:, -1, :]
+                _quantize_fn(prompt_cache)
+                logprobs = logits - mx.logsumexp(logits)
+                y_next = sampler(logprobs)
+                if outputs.cross_attention_states is not None:
+                    kwargs = {"cross_attention_states": outputs.cross_attention_states}
+                elif outputs.encoder_outputs is not None:
+                    kwargs = {"encoder_outputs": outputs.encoder_outputs}
+                else:
+                    kwargs = {}
+            return y_next, logprobs.squeeze(0)
+
+        n = 0
+        next_y = next_logprobs = None
+        while True:
+            if n != max_tokens:
+                next_y, next_logprobs = _decode_step(y[None])
+                mx.async_eval(next_y)
+            if n == 0:
+                mx.eval(y)
+            if n == max_tokens:
+                break
+            token_int = y.item()
+
+            # EOS / stopping check (mirrors upstream stream_generate).
+            if stopping_criteria is not None:
+                try:
+                    if stopping_criteria(token_int):
+                        break
+                except Exception:
+                    pass
+
+            segment_text = ""
+            if detokenizer is not None:
+                try:
+                    detokenizer.add_token(token_int)
+                    segment_text = detokenizer.last_segment
+                except Exception:
+                    segment_text = ""
+
+            yield GenerationResult(
+                text=segment_text,
+                token=token_int,
+                prompt_tokens=total_prompt_tokens,
+                generation_tokens=n + 1,
+                total_tokens=total_prompt_tokens + n + 1,
+            )
+            if n % 256 == 0:
+                mx.clear_cache()
+            y, logprobs = next_y, next_logprobs
+            n += 1
+
+        # Flush detokenizer remainder (same pattern as upstream).
+        if detokenizer is not None:
+            try:
+                detokenizer.finalize()
+                tail = detokenizer.last_segment
+                if tail:
+                    yield GenerationResult(
+                        text=tail,
+                        token=y.item() if y is not None else 0,
+                        prompt_tokens=total_prompt_tokens,
+                        generation_tokens=n,
+                        total_tokens=total_prompt_tokens + n,
+                    )
+            except Exception:
+                pass
+
+
 def _stream_generate_unified(
     rest_tokens,
     max_tokens,
@@ -3749,6 +4397,9 @@ def _stream_generate_unified(
     vlm_mask=None,
     vlm_kwargs=None,
     cache_match_type="miss",
+    snapshot_boundaries: Optional[List[int]] = None,
+    on_snapshot: Optional[Any] = None,
+    cache_base_depth: int = 0,
 ):
     """
     Yields response objects with .text and .token (LM: GenerationResponse, VLM: GenerationResult).
@@ -3795,6 +4446,32 @@ def _stream_generate_unified(
                 sliced_mask = vlm_mask[..., -len(rest_tokens) :]
             else:
                 sliced_mask = vlm_mask[..., -1:]
+
+        # G4v2: dispatch to the snapshot-aware fork iff (a) the feature is
+        # enabled, (b) the classifier found non-sliceable layers (hybrid),
+        # and (c) there's a snapshot boundary to emit or a callback (always
+        # pass through so intermediate snapshots fire even on non-miss
+        # turns).  Otherwise fall back to upstream `stream_generate_vlm`.
+        _use_fork = (
+            SETTINGS.enable_snapshot_stitch_vlm
+            and len(_NON_SLICEABLE_LAYER_INDICES) > 0
+            and (snapshot_boundaries is not None or on_snapshot is not None)
+        )
+        if _use_fork:
+            for resp in _vlm_generate_with_snapshots(
+                rest_ids=rest_ids,
+                pixel_values=vlm_pixel_values if use_vision else None,
+                mask=sliced_mask if use_vision else None,
+                vlm_kwargs=dict(vlm_kwargs) if vlm_kwargs else {},
+                prompt_cache=prompt_cache,
+                sampler=sampler,
+                max_tokens=max_tokens,
+                snapshot_boundaries=list(snapshot_boundaries or []),
+                on_snapshot=on_snapshot,
+                cache_base_depth=cache_base_depth,
+            ):
+                yield resp
+            return
 
         kwargs = {
             "input_ids": rest_ids,
@@ -4234,6 +4911,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         SETTINGS.model_path,
                         stable_prefix_toks,
                         request_model_tokens=model_tokens,
+                        session_id=(session_ctx.session_id or "").strip()
+                        if session_ctx
+                        else None,
                     )
                     if (
                         sp_cache is not None
@@ -4329,6 +5009,69 @@ class APIHandler(BaseHTTPRequestHandler):
             rest_count = (
                 len(rest_tokens) if rest_tokens is not None else len(model_tokens)
             )
+
+            # --- G4v2: prepare snapshot boundaries + emit callback ---
+            # Computed ONCE per request: absolute model-token depths at which
+            # to snapshot the non-sliceable layers during prefill.  For
+            # text-only VLM traffic (pi/OpenClaw today) msg_token_lens is
+            # model-space accurate; for image-containing turns it's only
+            # canonical-accurate (the VLM processor expands image pads to
+            # per-feature tokens) so we skip snapshot emission in that case
+            # to avoid depth drift.  Stitching at lookup time still works
+            # with any existing text-only snapshots.
+            _g4_enabled = (
+                is_vlm
+                and SETTINGS.enable_snapshot_stitch_vlm
+                and len(_NON_SLICEABLE_LAYER_INDICES) > 0
+                and not _messages_have_images(messages)
+            )
+            _snapshot_boundaries: List[int] = []
+            _on_snapshot_cb = None
+            _cache_base_depth = _kv_cache_offset(prompt_cache) or 0
+            if _g4_enabled:
+                try:
+                    _msg_lens = _compute_msg_token_boundaries(messages, model_tokens)
+                    _snapshot_boundaries = _compute_snapshot_boundaries(
+                        _msg_lens,
+                        prompt_token_len=len(model_tokens),
+                        min_gap_tokens=SETTINGS.snapshot_boundary_min_gap_tokens,
+                        max_count=SETTINGS.snapshot_store_max_entries_per_session,
+                    )
+                except Exception:
+                    _snapshot_boundaries = []
+
+                _session_id_for_snap = (session_ctx.session_id or "").strip()
+                _canon_len_for_snap = len(prompt_tokens)
+                _rid = request_id
+
+                def _on_snapshot_cb(
+                    boundary_depth: int, cache: List[Any]
+                ) -> None:
+                    if not _session_id_for_snap:
+                        return
+                    try:
+                        _layers = _snapshot_capture_layers(cache)
+                    except Exception as e:
+                        _terminal_status(
+                            "⚠️",
+                            f"snapshot capture failed at depth={boundary_depth}: {e}",
+                            indent=1,
+                        )
+                        return
+                    _snap = PartialSnapshot(
+                        session_id=_session_id_for_snap,
+                        model_token_count=int(boundary_depth),
+                        layers=_layers,
+                        canonical_token_count=min(
+                            int(boundary_depth), _canon_len_for_snap
+                        ),
+                        created_at=time.time(),
+                        request_id=_rid,
+                    )
+                    with prompt_cache_lock:
+                        SNAPSHOT_STORE.put(_snap)
+                    _bump_metric("snapshot_emitted", _rid)
+
             cache_session_id = _cache_log_session_id(session_ctx, cache_session_tokens)
             if SETTINGS.enable_request_logging:
                 try:
@@ -4446,6 +5189,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     vlm_mask=vlm_mask,
                     vlm_kwargs=vlm_kwargs,
                     cache_match_type=cache_match_type,
+                    snapshot_boundaries=_snapshot_boundaries,
+                    on_snapshot=_on_snapshot_cb,
+                    cache_base_depth=_cache_base_depth,
                 ):
                     generated_parts.append(response.text)
                     generated_tokens.append(int(response.token))
@@ -4639,6 +5385,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 message_text_parts: List[str] = []
                 reasoning_text_parts: List[str] = []
                 progress_last_at = time.time()
+                # Tracks the last time ANY byte was written to the SSE stream.
+                # Used to emit SSE comment heartbeats during long tool-call
+                # generations when the splitter is buffering output, so
+                # client-side body-read timeouts (e.g. undici bodyTimeout
+                # default 300s) don't kill the connection while the model
+                # is still productively decoding.
+                last_stream_write_at = [time.time()]
                 splitter = _ReasoningStreamSplitter(
                     enable_thinking, SETTINGS.model_family
                 )
@@ -4667,6 +5420,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                     )
                     self.wfile.flush()
+                    last_stream_write_at[0] = time.time()
 
                 for response in _stream_generate_unified(
                     rest_tokens,
@@ -4677,6 +5431,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     vlm_mask=vlm_mask,
                     vlm_kwargs=vlm_kwargs,
                     cache_match_type=cache_match_type,
+                    snapshot_boundaries=_snapshot_boundaries,
+                    on_snapshot=_on_snapshot_cb,
+                    cache_base_depth=_cache_base_depth,
                 ):
                     generated_tokens.append(int(response.token))
                     if first_token_at is None:
@@ -4704,6 +5461,23 @@ class APIHandler(BaseHTTPRequestHandler):
                             f"Request {request_id} in progress | generated_tokens={len(generated_tokens)}",
                             indent=1,
                         )
+                    # SSE keep-alive: when the splitter is buffering a
+                    # tool-call body no deltas flow to the client, and
+                    # undici / fetch body-read timeouts (default 300s)
+                    # will kill the connection even though the model is
+                    # still productively decoding.  An SSE comment line
+                    # is ignored by the parser but resets the client's
+                    # read-idle timer.  15s cadence leaves wide margin
+                    # below the 300s default.
+                    if (time.time() - last_stream_write_at[0]) >= 15.0:
+                        try:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            # Client already gave up; let the watchdog
+                            # / normal loop exit handle teardown.
+                            pass
+                        last_stream_write_at[0] = time.time()
                     # G2: cooperative abort between tokens — same rationale
                     # as the non-streaming path.  Partial KV state must not
                     # be cached; the streaming epilogue below emits a
